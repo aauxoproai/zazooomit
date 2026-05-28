@@ -3,3 +3,13 @@ node_modules/
 .env
 .env.local
 .runtimeconfig.json
+
+# Defense-in-depth — credentials / private keys
+.env.*
+*.pem
+*.p12
+*.key
+*.crt
+*-firebase-adminsdk-*.json
+service-account*.json
+*credentials*.json
