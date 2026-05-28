@@ -806,13 +806,9 @@ exports.onReportCreate = onDocumentCreated(
 
 // -----------------------------------------------------------------------------
 // D-12. onReviewCreate
-//   RatingScreen writes a reviews/{reviewId} doc but nothing recomputed the
-//   reviewed user's aggregate rating. This trigger recomputes rating_avg +
-//   rating_count on users/{reviewed_user_id} from all of their reviews on
-//   every new review. v2 Firestore trigger, same shape as onReportCreate.
-//
-//   STUB (Day 2 overnight): written + syntax-checked, NOT deployed. Founder to
-//   review and `firebase deploy --only functions:onReviewCreate` on Day 3.
+//   Recomputes rating_avg + rating_count on users/{reviewed_user_id} from
+//   all reviews of that user. v2 Firestore trigger, same shape as
+//   onReportCreate.
 // -----------------------------------------------------------------------------
 
 exports.onReviewCreate = onDocumentCreated(
