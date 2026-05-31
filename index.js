@@ -42,6 +42,7 @@ const STRIPE_WEBHOOK_SECRET = defineSecret('STRIPE_WEBHOOK_SECRET');
 const TWILIO_ACCOUNT_SID = defineSecret('TWILIO_ACCOUNT_SID');
 const TWILIO_AUTH_TOKEN = defineSecret('TWILIO_AUTH_TOKEN');
 const TWILIO_FROM_NUMBER = defineSecret('TWILIO_FROM_NUMBER');
+const GEMINI_API_KEY = defineSecret('GEMINI_API_KEY');
 
 // Sandbox kill switch. Default is 'false' so sandbox / preview deploys
 // never send real SMS even if Twilio credentials are set. Flip to 'true'
@@ -990,3 +991,383 @@ async function loadTrustedContact(userId) {
   if (!snap.exists) return null;
   return { id: snap.id, ...snap.data() };
 }
+
+// =============================================================================
+// PHOTO → ADS + QR  (detectItemsFromPhoto + publishListingsFromDetection)
+// =============================================================================
+//
+// One uploaded photo becomes one or many marketplace listings, each with a
+// cropped photo and a scannable QR code. Two callables:
+//
+//   detectItemsFromPhoto(storagePath)
+//     -> Gemini vision detects sellable items + bounding boxes. No writes.
+//
+//   publishListingsFromDetection(storagePath, mode, items[])
+//     -> mode 'separate': one listing per item, photo cropped to its box.
+//        mode 'bundle':   one listing, whole photo, combined price.
+//     Each listing gets photo.jpg + qr.png in Storage and a `listings` doc.
+//
+// Runs in us-east1 (override of the us-central1 global default) to match the
+// Firestore + Storage region. Heavy deps (vertexai/sharp/qrcode) are lazily
+// required so the Stripe/Twilio functions above don't pay their cold-start.
+//
+// Listings schema note: the live hardened rules (firestore.rules) require
+// `status: 'active'` (lowercase) and a `photos` LIST — there is no photo_url
+// field in the client-writable schema. The Admin SDK bypasses rules, so we
+// write a superset: `photos:[url]` + `status:'active'` (what the app reads)
+// PLUS `photo_url`/`qr_url` (convenience, also returned to the caller).
+
+const PHOTO_REGION = 'us-east1';
+// gemini-2.5-flash is served from us-central1 on Vertex. The function itself
+// runs in us-east1 (PHOTO_REGION); only the Vertex AI request targets
+// us-central1. NOTE: location 'global' makes the deprecated @google-cloud/vertexai
+// SDK hit a non-JSON endpoint -> "Unexpected token '<'" / vision_failed
+// (verified 2026-05-31); a real region is required.
+const VERTEX_LOCATION = process.env.VERTEX_LOCATION || 'us-central1';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const LISTING_URL_BASE =
+  process.env.LISTING_URL_BASE || 'https://zazooomit.com/listing';
+const GCP_PROJECT = process.env.GCLOUD_PROJECT || 'zazooom-app';
+
+// ---- lazy deps --------------------------------------------------------------
+
+let _sharp = null;
+function sharpLib() {
+  if (!_sharp) _sharp = require('sharp');
+  return _sharp;
+}
+let _qrcode = null;
+function qrcodeLib() {
+  if (!_qrcode) _qrcode = require('qrcode');
+  return _qrcode;
+}
+let _genModel = null;
+function geminiModel() {
+  if (_genModel) return _genModel;
+  // Gemini Developer API (generativelanguage.googleapis.com) via API key —
+  // intentionally NOT Vertex/aiplatform, which stayed SERVICE_DISABLED on this
+  // project despite enablement. The generateContent request/response shape is
+  // the same as the prior Vertex SDK, so the detect handler is unchanged.
+  const { GoogleGenerativeAI } = require('@google/generative-ai');
+  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY.value());
+  _genModel = genAI.getGenerativeModel({
+    model: GEMINI_MODEL,
+    generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },
+  });
+  return _genModel;
+}
+function defaultBucket() {
+  const { getStorage } = require('firebase-admin/storage');
+  return getStorage().bucket();
+}
+
+// ---- helpers ----------------------------------------------------------------
+
+/** Reject empty / traversing / absolute storage paths; normalize gs:// URLs. */
+function sanitizeStoragePath(p) {
+  if (typeof p !== 'string' || p.length === 0) {
+    throw new HttpsError('invalid-argument', 'storagePath must be a non-empty string.');
+  }
+  let path = p;
+  // FlutterFlow stores Firebase *download URLs* in capturedPhotoUrls, e.g.
+  // https://firebasestorage.googleapis.com/v0/b/<bucket>/o/<ENCODED_PATH>?alt=media&token=...
+  // Extract + URL-decode the /o/ segment back into the object path.
+  const fbMatch = path.match(/\/o\/([^?]+)/);
+  if (fbMatch) {
+    path = decodeURIComponent(fbMatch[1]);
+  } else if (path.startsWith('gs://')) {
+    path = path.replace(/^gs:\/\/[^/]+\//, '');
+  }
+  path = path.replace(/^\/+/, '');
+  if (path.includes('..')) {
+    throw new HttpsError('invalid-argument', "storagePath may not contain '..'.");
+  }
+  if (path.length === 0) {
+    throw new HttpsError('invalid-argument', 'storagePath resolved to empty.');
+  }
+  return path;
+}
+
+/** Coerce anything to a finite, non-negative number, else fallback. */
+function safeNum(v, fallback = 0) {
+  const n = typeof v === 'number'
+    ? v
+    : parseFloat(String(v == null ? '' : v).replace(/[^0-9.\-]/g, ''));
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/** Download an object's bytes + content type from the default bucket. */
+async function downloadImage(storagePath) {
+  const bucket = defaultBucket();
+  const file = bucket.file(storagePath);
+  const [exists] = await file.exists();
+  if (!exists) throw new HttpsError('not-found', `Object not found: ${storagePath}`);
+  const [meta] = await file.getMetadata();
+  const [buffer] = await file.download();
+  return { buffer, contentType: meta.contentType || 'image/jpeg', bucket };
+}
+
+/**
+ * Save a buffer to Storage and return a tokenized Firebase download URL.
+ *
+ * We deliberately do NOT use file.makePublic(): the bucket has Uniform
+ * Bucket-Level Access (object ACLs disabled), so makePublic() throws; and the
+ * live Storage rules deny read on `listings/**` anyway. Writing a
+ * `firebaseStorageDownloadTokens` metadata value yields a
+ * firebasestorage.googleapis.com URL that bypasses both rules and UBLA — the
+ * same URL format the FlutterFlow client already produces on upload.
+ */
+async function savePublic(bucket, objectPath, buffer, contentType) {
+  const { randomUUID } = require('crypto');
+  const token = randomUUID();
+  const file = bucket.file(objectPath);
+  await file.save(buffer, {
+    resumable: false,
+    contentType,
+    metadata: {
+      cacheControl: 'public, max-age=31536000',
+      metadata: { firebaseStorageDownloadTokens: token },
+    },
+  });
+  return `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/` +
+    `${encodeURIComponent(objectPath)}?alt=media&token=${token}`;
+}
+
+/** Generate a QR PNG buffer encoding the public listing URL. */
+function qrBuffer(listingId) {
+  return qrcodeLib().toBuffer(`${LISTING_URL_BASE}/${listingId}`, {
+    type: 'png',
+    width: 512,
+    margin: 2,
+    errorCorrectionLevel: 'M',
+  });
+}
+
+/**
+ * Convert a 0-1000 normalized, top-left-origin box to integer pixel crop
+ * geometry clamped to the image. Returns null if the box is degenerate.
+ */
+function boxToExtract(box, width, height) {
+  if (!box || !width || !height) return null;
+  const xmin = safeNum(box.xmin);
+  const ymin = safeNum(box.ymin);
+  const xmax = safeNum(box.xmax);
+  const ymax = safeNum(box.ymax);
+
+  let left = Math.round((xmin / 1000) * width);
+  let top = Math.round((ymin / 1000) * height);
+  let w = Math.round(((xmax - xmin) / 1000) * width);
+  let h = Math.round(((ymax - ymin) / 1000) * height);
+
+  left = Math.min(Math.max(left, 0), Math.max(width - 1, 0));
+  top = Math.min(Math.max(top, 0), Math.max(height - 1, 0));
+  w = Math.min(Math.max(w, 1), width - left);
+  h = Math.min(Math.max(h, 1), height - top);
+
+  if (w < 1 || h < 1) return null;
+  return { left, top, width: w, height: h };
+}
+
+/** Build a `listings` doc payload conforming to the live hardened schema. */
+function buildListingDoc(uid, f) {
+  return {
+    seller_id: uid,
+    title: f.title,
+    description: f.description || '',
+    category: f.category || 'Other',
+    condition: f.condition || 'Good',
+    price: f.price,
+    photos: [f.photo_url],      // list — what the app feed reads
+    photo_url: f.photo_url,     // convenience mirror (Admin-written)
+    qr_url: f.qr_url,
+    status: 'active',           // lowercase — required by firestore.rules
+    view_count: 0,
+    created_at: FieldValue.serverTimestamp(),
+  };
+}
+
+// ---- FUNCTION 1: detectItemsFromPhoto ---------------------------------------
+
+const DETECT_PROMPT = `You are a marketplace listing assistant. Look at the image and identify each distinct sellable physical item.
+
+Return ONLY valid JSON (no markdown, no code fences, no commentary) in EXACTLY this shape:
+{
+  "items": [
+    {
+      "label": "short noun label, e.g. 'sneaker'",
+      "title": "catchy marketplace listing title",
+      "description": "1-3 sentence selling description",
+      "category": "one of: Electronics, Clothing, Shoes, Home, Toys, Sports, Books, Tools, Beauty, Other",
+      "condition": "one of: New, Like New, Good, Fair, Poor",
+      "priceEstimate": 0,
+      "box": { "ymin": 0, "xmin": 0, "ymax": 1000, "xmax": 1000 }
+    }
+  ]
+}
+
+Rules:
+- priceEstimate is a NUMBER in USD (no currency symbol).
+- box coordinates are integers normalized 0-1000 with origin at the TOP-LEFT (Gemini convention): ymin/xmin = top-left corner, ymax/xmax = bottom-right corner.
+- One entry per distinct item. If only one item, return one entry.
+- If you see no sellable item, return {"items": []}.`;
+
+exports.detectItemsFromPhoto = onCall(
+  { region: PHOTO_REGION, memory: '1GiB', timeoutSeconds: 300, secrets: [GEMINI_API_KEY] },
+  async (request) => {
+    const uid = requireAuth(request);
+    const storagePath = sanitizeStoragePath(request.data && request.data.storagePath);
+    console.log('detectItemsFromPhoto', { uid, storagePath });
+
+    const { buffer, contentType } = await downloadImage(storagePath);
+
+    // Pixel dimensions so the caller can convert boxes -> px later.
+    let width = 0;
+    let height = 0;
+    try {
+      const meta = await sharpLib()(buffer).metadata();
+      width = meta.width || 0;
+      height = meta.height || 0;
+    } catch (e) {
+      console.warn('sharp metadata failed', String(e));
+    }
+
+    let raw = '';
+    try {
+      const resp = await geminiModel().generateContent({
+        contents: [{
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType: contentType, data: buffer.toString('base64') } },
+            { text: DETECT_PROMPT },
+          ],
+        }],
+      });
+      const cand = resp.response
+        && resp.response.candidates
+        && resp.response.candidates[0];
+      raw = ((cand && cand.content && cand.content.parts) || [])
+        .map((p) => p.text || '')
+        .join('');
+    } catch (e) {
+      console.error('Gemini generateContent failed', String(e));
+      return { items: [], storagePath, width, height, error: 'vision_failed' };
+    }
+
+    // Strip code fences defensively, then parse.
+    let cleaned = raw.trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      console.warn('JSON parse failed', cleaned.slice(0, 500));
+      return { items: [], storagePath, width, height, error: 'parse_failed' };
+    }
+
+    const items = Array.isArray(parsed.items) ? parsed.items : [];
+    console.log('detected items', items.length);
+    return { items, storagePath, width, height };
+  },
+);
+
+// ---- FUNCTION 2: publishListingsFromDetection -------------------------------
+
+exports.publishListingsFromDetection = onCall(
+  { region: PHOTO_REGION, memory: '1GiB', timeoutSeconds: 300 },
+  async (request) => {
+    const uid = requireAuth(request);
+    const data = request.data || {};
+    const storagePath = sanitizeStoragePath(data.storagePath);
+    const mode = data.mode === 'bundle' ? 'bundle' : 'separate';
+    const items = Array.isArray(data.items) ? data.items : [];
+    if (items.length === 0) {
+      throw new HttpsError('invalid-argument', 'items[] must be non-empty.');
+    }
+    console.log('publishListingsFromDetection', { uid, mode, count: items.length });
+
+    const { buffer, bucket } = await downloadImage(storagePath);
+    const meta = await sharpLib()(buffer).metadata();
+    const width = meta.width || 0;
+    const height = meta.height || 0;
+
+    // ----- BUNDLE: one listing, whole photo, one QR -----
+    if (mode === 'bundle') {
+      const ref = db.collection('listings').doc();
+      const listingId = ref.id;
+
+      const lines = items.map((it, i) => {
+        const t = it.title || it.label || `Item ${i + 1}`;
+        return `• ${t}${it.description ? ` — ${it.description}` : ''}`;
+      });
+      const sum = items.reduce((acc, it) => acc + safeNum(it.priceEstimate != null ? it.priceEstimate : it.price), 0);
+
+      const title = (data.bundleTitle && String(data.bundleTitle).trim())
+        || `Bundle: ${items.length} items`;
+      const description = (data.bundleDescription && String(data.bundleDescription).trim())
+        || lines.join('\n');
+      const price = data.bundlePrice != null ? safeNum(data.bundlePrice) : sum;
+
+      const photoBuf = await sharpLib()(buffer).jpeg({ quality: 85 }).toBuffer();
+      const photo_url = await savePublic(
+        bucket, `listings/${uid}/${listingId}/photo.jpg`, photoBuf, 'image/jpeg');
+      const qr_url = await savePublic(
+        bucket, `listings/${uid}/${listingId}/qr.png`, await qrBuffer(listingId), 'image/png');
+
+      await ref.set(buildListingDoc(uid, {
+        title,
+        description,
+        category: items[0] && items[0].category,
+        condition: items[0] && items[0].condition,
+        price,
+        photo_url,
+        qr_url,
+      }));
+
+      console.log('bundle listing created', listingId);
+      return { mode, listings: [{ listingId, photo_url, qr_url }] };
+    }
+
+    // ----- SEPARATE: one listing per item, cropped to its box -----
+    const results = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const ref = db.collection('listings').doc();
+      const listingId = ref.id;
+
+      const extract = boxToExtract(it.box, width, height);
+      let photoBuf;
+      try {
+        const pipe = sharpLib()(buffer);
+        photoBuf = await (extract ? pipe.extract(extract) : pipe)
+          .jpeg({ quality: 85 })
+          .toBuffer();
+      } catch (e) {
+        console.warn('crop failed, using full image', i, String(e));
+        photoBuf = await sharpLib()(buffer).jpeg({ quality: 85 }).toBuffer();
+      }
+
+      const photo_url = await savePublic(
+        bucket, `listings/${uid}/${listingId}/photo.jpg`, photoBuf, 'image/jpeg');
+      const qr_url = await savePublic(
+        bucket, `listings/${uid}/${listingId}/qr.png`, await qrBuffer(listingId), 'image/png');
+
+      await ref.set(buildListingDoc(uid, {
+        title: it.title || it.label || `Item ${i + 1}`,
+        description: it.description || '',
+        category: it.category,
+        condition: it.condition,
+        price: safeNum(it.priceEstimate != null ? it.priceEstimate : it.price),
+        photo_url,
+        qr_url,
+      }));
+
+      console.log('separate listing created', listingId, i);
+      results.push({ listingId, photo_url, qr_url });
+    }
+
+    return { mode, listings: results };
+  },
+);
