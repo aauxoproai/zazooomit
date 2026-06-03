@@ -43,6 +43,13 @@ const TWILIO_ACCOUNT_SID = defineSecret('TWILIO_ACCOUNT_SID');
 const TWILIO_AUTH_TOKEN = defineSecret('TWILIO_AUTH_TOKEN');
 const TWILIO_FROM_NUMBER = defineSecret('TWILIO_FROM_NUMBER');
 const GEMINI_API_KEY = defineSecret('GEMINI_API_KEY');
+// Claude (Anthropic) vision — used by scanItems (Home Scan / room video).
+// Set once with:  firebase functions:secrets:set ANTHROPIC_API_KEY
+const ANTHROPIC_API_KEY = defineSecret('ANTHROPIC_API_KEY');
+// Shared secret for the website's POST /api/listings — held server-side so the
+// app never embeds it. Same value as the web's APP_LISTINGS_SECRET.
+// Set once with:  firebase functions:secrets:set APP_LISTINGS_SECRET
+const APP_LISTINGS_SECRET = defineSecret('APP_LISTINGS_SECRET');
 
 // Sandbox kill switch. Default is 'false' so sandbox / preview deploys
 // never send real SMS even if Twilio credentials are set. Flip to 'true'
@@ -1369,5 +1376,264 @@ exports.publishListingsFromDetection = onCall(
     }
 
     return { mode, listings: results };
+  },
+);
+
+// =============================================================================
+// HOME SCAN  (scanItems)
+// =============================================================================
+//
+//   scanItems(videoPath)
+//     -> Downloads a short room-scan video from Storage, extracts ~1 frame/sec
+//        (server-side ffmpeg), sends the frames to Claude vision, and returns a
+//        deduped array of sellable items with a price range. No writes — the
+//        app reviews the items, then reuses publishListingsFromDetection's
+//        sibling flow (ListingPreview -> Where-to-Post -> publish) to list them.
+//
+//     Returns: { items:[{title,category,condition,priceLow,priceHigh}], total,
+//                frameCount, videoPath, error? }
+//
+// Claude (not Gemini) per product spec; the key lives in Secret Manager
+// (ANTHROPIC_API_KEY), never in client code. Runs in us-east1 to match Storage.
+
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
+const SCAN_MAX_FRAMES = parseInt(process.env.SCAN_MAX_FRAMES || '20', 10);
+
+let _anthropic = null;
+function anthropicClient() {
+  if (_anthropic) return _anthropic;
+  const Anthropic = require('@anthropic-ai/sdk');
+  _anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY.value() });
+  return _anthropic;
+}
+let _ffmpegPath = null;
+function ffmpegBin() {
+  if (!_ffmpegPath) _ffmpegPath = require('ffmpeg-static');
+  return _ffmpegPath;
+}
+
+/**
+ * Extract up to `maxFrames` JPEG frames at ~1 fps from a video buffer using the
+ * bundled static ffmpeg binary. Frames are scaled to <=768px wide to keep the
+ * vision payload small. Returns an array of JPEG Buffers (chronological).
+ */
+async function extractFrames(videoBuffer, maxFrames) {
+  const os = require('os');
+  const path = require('path');
+  const fsp = require('fs/promises');
+  const { spawn } = require('child_process');
+
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'scan-'));
+  const inPath = path.join(tmpDir, 'input.mp4');
+  const pattern = path.join(tmpDir, 'frame-%03d.jpg');
+  try {
+    await fsp.writeFile(inPath, videoBuffer);
+    await new Promise((resolve, reject) => {
+      const proc = spawn(ffmpegBin(), [
+        '-i', inPath,
+        '-vf', "fps=1,scale='min(768,iw)':-2",
+        '-frames:v', String(maxFrames),
+        '-q:v', '4',
+        pattern,
+      ], { stdio: 'ignore' });
+      proc.on('error', reject);
+      proc.on('close', (code) => (code === 0
+        ? resolve()
+        : reject(new Error(`ffmpeg exited ${code}`))));
+    });
+
+    const names = (await fsp.readdir(tmpDir))
+      .filter((f) => f.startsWith('frame-') && f.endsWith('.jpg'))
+      .sort();
+    const frames = [];
+    for (const n of names.slice(0, maxFrames)) {
+      frames.push(await fsp.readFile(path.join(tmpDir, n)));
+    }
+    return frames;
+  } finally {
+    await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+const SCAN_PROMPT = `You are a marketplace listing assistant. The images are frames from a short video panning around a room. Identify every DISTINCT sellable physical item visible across ALL the frames combined.
+
+The SAME real-world object usually appears in several consecutive frames — count it ONCE. Deduplicate aggressively across frames.
+
+Return ONLY valid JSON (no markdown, no code fences, no commentary) in EXACTLY this shape:
+{
+  "items": [
+    {
+      "title": "catchy marketplace listing title",
+      "category": "one of: Electronics, Clothing, Shoes, Home, Toys, Sports, Books, Tools, Beauty, Other",
+      "condition": "one of: New, Like New, Good, Fair, Poor",
+      "priceLow": 0,
+      "priceHigh": 0
+    }
+  ]
+}
+
+Rules:
+- priceLow and priceHigh are NUMBERS in USD (no currency symbol), priceLow <= priceHigh, based on typical US used-resale values.
+- One entry per distinct real-world item. Do NOT emit the same item multiple times because it appears in multiple frames.
+- Only movable, sellable goods. Skip fixtures and built-ins (walls, floors, doors, windows, outlets, ceiling fixtures, built-in cabinets).
+- If you see nothing sellable, return {"items": []}.`;
+
+/** Normalize one model item to the strict {title,category,condition,priceLow,priceHigh} shape. */
+function normalizeScanItem(it) {
+  const CATEGORIES = ['Electronics', 'Clothing', 'Shoes', 'Home', 'Toys', 'Sports', 'Books', 'Tools', 'Beauty', 'Other'];
+  const CONDITIONS = ['New', 'Like New', 'Good', 'Fair', 'Poor'];
+  const title = (it && it.title ? String(it.title) : '').trim() || 'Untitled item';
+  const category = CATEGORIES.includes(it && it.category) ? it.category : 'Other';
+  const condition = CONDITIONS.includes(it && it.condition) ? it.condition : 'Good';
+  let low = safeNum(it && it.priceLow);
+  let high = safeNum(it && it.priceHigh, low);
+  if (high < low) { const t = low; low = high; high = t; }
+  return { title, category, condition, priceLow: low, priceHigh: high };
+}
+
+/** Safety-net dedupe by case-folded title (the model is also told to dedupe). */
+function dedupeByTitle(items) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const key = it.title.toLowerCase().replace(/\s+/g, ' ').trim();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+  return out;
+}
+
+exports.scanItems = onCall(
+  { region: PHOTO_REGION, memory: '2GiB', timeoutSeconds: 300, secrets: [ANTHROPIC_API_KEY] },
+  async (request) => {
+    const uid = requireAuth(request);
+    const videoPath = sanitizeStoragePath(request.data && request.data.videoPath);
+    console.log('scanItems', { uid, videoPath });
+
+    // downloadImage is a generic byte-download (name aside) — reuse it for video.
+    const { buffer } = await downloadImage(videoPath);
+
+    let frames;
+    try {
+      frames = await extractFrames(buffer, SCAN_MAX_FRAMES);
+    } catch (e) {
+      console.error('frame extraction failed', String(e));
+      return { items: [], total: 0, frameCount: 0, videoPath, error: 'frame_extraction_failed' };
+    }
+    if (frames.length === 0) {
+      return { items: [], total: 0, frameCount: 0, videoPath, error: 'no_frames' };
+    }
+    console.log('extracted frames', frames.length);
+
+    let raw = '';
+    try {
+      const content = frames.map((buf) => ({
+        type: 'image',
+        source: { type: 'base64', media_type: 'image/jpeg', data: buf.toString('base64') },
+      }));
+      content.push({ type: 'text', text: SCAN_PROMPT });
+
+      const msg = await anthropicClient().messages.create({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 2000,
+        messages: [{ role: 'user', content }],
+      });
+      raw = (msg.content || [])
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text)
+        .join('');
+    } catch (e) {
+      console.error('Claude vision failed', String(e));
+      return { items: [], total: 0, frameCount: frames.length, videoPath, error: 'vision_failed' };
+    }
+
+    let cleaned = raw.trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .trim();
+    const start = cleaned.indexOf('{');
+    const end = cleaned.lastIndexOf('}');
+    if (start !== -1 && end !== -1) cleaned = cleaned.slice(start, end + 1);
+
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      console.warn('scan JSON parse failed', cleaned.slice(0, 500));
+      return { items: [], total: 0, frameCount: frames.length, videoPath, error: 'parse_failed' };
+    }
+
+    const rawItems = Array.isArray(parsed.items) ? parsed.items : [];
+    const items = dedupeByTitle(rawItems.map(normalizeScanItem));
+    // "≈ $total" on the results screen = sum of each item's midpoint price.
+    const total = Math.round(
+      items.reduce((acc, it) => acc + (it.priceLow + it.priceHigh) / 2, 0),
+    );
+    console.log('scan items', { detected: rawItems.length, deduped: items.length, total });
+
+    return { items, total, frameCount: frames.length, videoPath };
+  },
+);
+
+// =============================================================================
+// POST LISTING TO WEB  (postListing)
+// =============================================================================
+//
+//   postListing(draft)
+//     -> Authenticated Firebase callable. Forwards the listing draft to the
+//        website's POST /api/listings (the canonical Supabase store), attaching
+//        the APP_LISTINGS shared secret SERVER-SIDE (never in the app binary).
+//        sellerId is taken from the verified Firebase auth uid — the client
+//        cannot spoof it. Returns the web API's { id, url }.
+//
+// This replaces the app embedding APP_LISTINGS_SECRET: the app calls this
+// callable (signed in), and only this function knows the secret.
+
+const WEB_API_URL = process.env.WEB_API_URL || 'https://zazooomit.com/api/listings';
+
+exports.postListing = onCall(
+  { region: PHOTO_REGION, timeoutSeconds: 60, secrets: [APP_LISTINGS_SECRET] },
+  async (request) => {
+    const uid = requireAuth(request);
+    const d = request.data || {};
+    const payload = {
+      title: d.title,
+      description: d.description,
+      price: d.price,
+      category: d.category,
+      condition: d.condition,
+      photos: Array.isArray(d.photos) ? d.photos : [],
+      sellerId: uid, // verified Firebase uid — not client-supplied
+      locationCity: d.locationCity,
+      lat: d.lat,
+      lng: d.lng,
+      source: 'app',
+    };
+
+    let res;
+    let json;
+    try {
+      res = await fetch(WEB_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-app-secret': APP_LISTINGS_SECRET.value(),
+        },
+        body: JSON.stringify(payload),
+      });
+      json = await res.json().catch(() => ({}));
+    } catch (e) {
+      console.error('postListing fetch failed', String(e));
+      throw new HttpsError('unavailable', 'Could not reach the marketplace.');
+    }
+    if (!res.ok) {
+      console.warn('postListing web API error', res.status, json && json.error);
+      throw new HttpsError(
+        res.status === 422 ? 'invalid-argument' : 'internal',
+        (json && json.error) || `web API ${res.status}`,
+      );
+    }
+    return json; // { id, url }
   },
 );
