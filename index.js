@@ -25,6 +25,10 @@ const {
   onRequest,
   HttpsError,
 } = require('firebase-functions/v2/https');
+// 1st-gen API (firebase-functions/v1) — used ONLY for the Auth onCreate trigger
+// below. Everything else in this file stays on the v2 API.
+const functionsV1 = require('firebase-functions/v1');
+const { getAuth } = require('firebase-admin/auth');
 const { defineSecret, defineString } = require('firebase-functions/params');
 const { initializeApp } = require('firebase-admin/app');
 const {
@@ -32,6 +36,10 @@ const {
   FieldValue,
 } = require('firebase-admin/firestore');
 const { setGlobalOptions } = require('firebase-functions/v2');
+
+// Pure Home Scan pipeline helpers (Stages 1-3). No Firebase deps — unit-tested
+// standalone in test/scan_pipeline.test.js.
+const scan = require('./scan_pipeline');
 
 // -----------------------------------------------------------------------------
 // Secrets
@@ -82,6 +90,90 @@ const db = getFirestore();
 // Default region for all functions. us-central1 keeps round-trip latency
 // reasonable for a US-launch marketplace.
 setGlobalOptions({ region: 'us-central1', maxInstances: 10 });
+
+// -----------------------------------------------------------------------------
+// Auth onCreate — Supabase Third-Party Auth role claim (Option 2).
+//
+//   Supabase maps a Firebase ID token to a Postgres role by reading the token's
+//   `role` claim. Firebase tokens have no `role` by default, so without this the
+//   app is treated as `anon` and every RLS policy / RPC scoped to `authenticated`
+//   (credit_balances reads, spend_credit) returns empty or denied.
+//
+//   This is a NON-BLOCKING Auth trigger (not an IP blocking function): blocking
+//   enforcement is not firing on this project, so we persist the claim out-of-band
+//   with the Admin SDK when the account is created. onCreate fires for ALL new
+//   accounts including anonymous. customClaims persist on the account and ride
+//   every future token.
+//
+//   TRADEOFF (must be handled app-side): onCreate runs asynchronously AFTER the
+//   first ID token is issued, so that first token lacks `role`. The auth
+//   bootstrap MUST call getIdToken(true) after sign-in (and after
+//   linkWithCredential) to force-refresh and pick up the claim. UID is unchanged
+//   across anon→permanent linking, so the persisted claim carries over.
+// -----------------------------------------------------------------------------
+
+// Supabase project REST base (public URL — not a secret).
+const SUPABASE_URL = 'https://rilyitrvilprhtxlocgc.supabase.co';
+
+/// One-time free-signup credit, written SERVER-SIDE for EVERY new account
+/// regardless of provider (Google, email/password, Apple, anonymous). onCreate
+/// fires exactly once per account, so this is the provider-agnostic equivalent of
+/// the website's handle_new_user() trigger (which only fires for Supabase
+/// auth.users rows, never for Firebase/TPA app users).
+///
+/// Idempotent + replay-proof with the SAME guarantee as POST /api/credits/grant:
+/// idempotency_key = 'free_signup:<uid>' + the UNIQUE index credits_ledger_idem_uidx.
+/// A duplicate insert returns HTTP 409, which we treat as already-granted. So a
+/// uid can only ever receive this grant once — even though the app ALSO calls
+/// grantFreeSignup() on some paths (both collapse to one row via the same key).
+///
+/// Best-effort + non-fatal: never throws out of onCreate (claim stamping above
+/// must still succeed). Requires the SUPABASE_SERVICE_ROLE_KEY secret.
+async function grantFreeSignupLedger(uid) {
+  try {
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!key) {
+      console.warn(`free_signup SKIPPED uid=${uid}: SUPABASE_SERVICE_ROLE_KEY unset`);
+      return;
+    }
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/credits_ledger`, {
+      method: 'POST',
+      headers: {
+        apikey: key,
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        firebase_uid: uid,
+        delta: 1,
+        reason: 'free_signup',
+        pack: 'free',
+        idempotency_key: `free_signup:${uid}`,
+      }),
+    });
+    if (res.status === 201 || res.status === 204) {
+      console.log(`free_signup GRANTED uid=${uid}`);
+    } else if (res.status === 409) {
+      console.log(`free_signup ALREADY uid=${uid}`); // unique_violation = idempotent
+    } else {
+      console.warn(`free_signup UNEXPECTED ${res.status} uid=${uid}: ${await res.text()}`);
+    }
+  } catch (e) {
+    console.warn(`free_signup ERROR uid=${uid}: ${e.message}`);
+  }
+}
+
+exports.stampAuthRoleOnCreate = functionsV1
+  .runWith({ secrets: ['SUPABASE_SERVICE_ROLE_KEY'] })
+  .auth.user()
+  .onCreate(async (user) => {
+    // 1) TPA role claim — required for RLS reads + spend_credit as `authenticated`.
+    await getAuth().setCustomUserClaims(user.uid, { role: 'authenticated' });
+    // 2) Free-signup credit for EVERY provider (the bug fix: Google/Apple paths
+    //    never called grantFreeSignup, so new federated accounts got 0 credits).
+    await grantFreeSignupLedger(user.uid);
+  });
 
 // Lazy-resolve helpers so cold starts only init clients when actually used.
 let _stripe = null;
@@ -1219,11 +1311,13 @@ Rules:
 - If you see no sellable item, return {"items": []}.`;
 
 exports.detectItemsFromPhoto = onCall(
-  { region: PHOTO_REGION, memory: '1GiB', timeoutSeconds: 300, secrets: [GEMINI_API_KEY] },
+  // GEMINI for detection + boxes; ANTHROPIC for the Stage-2 web_search SOLD-comps
+  // pricing (same engine scanItems uses) — re-pointed off the old Gemini estimate.
+  { region: PHOTO_REGION, memory: '1GiB', timeoutSeconds: 300, secrets: [GEMINI_API_KEY, ANTHROPIC_API_KEY] },
   async (request) => {
     const uid = requireAuth(request);
     const storagePath = sanitizeStoragePath(request.data && request.data.storagePath);
-    console.log('detectItemsFromPhoto', { uid, storagePath });
+    console.log('WIRECHECK_DETECT_SCANPIPE_V2 START', { uid, storagePath });
 
     const { buffer, contentType } = await downloadImage(storagePath);
 
@@ -1240,7 +1334,7 @@ exports.detectItemsFromPhoto = onCall(
 
     let raw = '';
     try {
-      const resp = await geminiModel().generateContent({
+      const genReq = {
         contents: [{
           role: 'user',
           parts: [
@@ -1248,7 +1342,27 @@ exports.detectItemsFromPhoto = onCall(
             { text: DETECT_PROMPT },
           ],
         }],
-      });
+      };
+      // gemini-2.5-flash intermittently 503s ("high demand"). Retry transient
+      // failures with backoff so a temporary spike doesn't surface to the user
+      // as "AI couldn't read the picture".
+      let resp;
+      let lastErr = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          resp = await geminiModel().generateContent(genReq);
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          const transient = /\b(50[0-9]|429)\b|unavailable|high demand|overload|quota|rate.?limit/i
+              .test(String(e));
+          if (!transient) throw e;
+          console.warn(`Gemini transient error (attempt ${attempt + 1}/4), retrying`, String(e));
+          await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+        }
+      }
+      if (lastErr) throw lastErr;
       const cand = resp.response
         && resp.response.candidates
         && resp.response.candidates[0];
@@ -1276,14 +1390,82 @@ exports.detectItemsFromPhoto = onCall(
 
     const items = Array.isArray(parsed.items) ? parsed.items : [];
     console.log('detected items', items.length);
-    return { items, storagePath, width, height };
+
+    // ---- PRICE EACH ITEM via the SAME web_search SOLD-comps engine scanItems
+    //      uses (scan_pipeline Stage 2) — replaces Gemini's priceEstimate. Gemini
+    //      still owns detection + boxes; Anthropic web_search owns pricing, so the
+    //      photo path now shows real comp-based prices + comp_basis, per item. ----
+    const priced = await Promise.all(items.map(async (it, idx) => {
+      // Map the Gemini item into the shape scan_pipeline's price prompt expects.
+      const priceItem = {
+        id: String(idx + 1),
+        name: (it.title || it.label || '').toString().trim() || 'Untitled item',
+        category: it.category || '',
+        condition: it.condition || '',
+        quantity: 1,
+      };
+      let price;
+      try {
+        const rawP = await claudeText({
+          content: scan.buildStage2PricePrompt(priceItem),
+          maxTokens: 1500,
+          tools: [WEB_SEARCH_TOOL],
+        });
+        price = scan.normalizeStage2Price(rawP, priceItem);
+      } catch (e) {
+        console.warn('photo Stage 2 pricing failed for', priceItem.name, String(e));
+        price = { low: 0, high: 0, suggested: 0, reason: '',
+          comp_basis: 'no comps found — model estimate' };
+      }
+      // Keep every Gemini detection field (label/title/description/category/
+      // condition/box); set priceEstimate from the comp-based suggested price and
+      // attach the comp metadata the UI can surface.
+      return {
+        ...it,
+        priceEstimate: price.suggested || price.per_item_price || 0,
+        priceLow: price.low,
+        priceHigh: price.high,
+        suggested: price.suggested,
+        reason: price.reason,
+        comp_basis: price.comp_basis,
+        confidence: price.confidence,
+      };
+    }));
+
+    console.log('WIRECHECK_DETECT_SCANPIPE_V2 RESULT',
+      JSON.stringify(priced.map((p) => ({
+        title: p.title,
+        priceEstimate: p.priceEstimate,
+        priceLow: p.priceLow,
+        priceHigh: p.priceHigh,
+        comp_basis: p.comp_basis,
+      }))));
+    return { items: priced, storagePath, width, height };
   },
 );
 
 // ---- FUNCTION 2: publishListingsFromDetection -------------------------------
 
+// Single-writer marketplace post used by publishListingsFromDetection. Non-fatal:
+// if the web POST fails we keep the Firestore mirror and return no url. The web
+// route authenticates via x-app-secret and writes Supabase with the service-role
+// key (server-side); status is 'active' once APP_POSTS_AUTOPUBLISH=true.
+async function postToMarketplace({ uid, title, description, price, category, condition, photos, locationCity, lat, lng }) {
+  try {
+    const res = await fetch(WEB_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-app-secret': APP_LISTINGS_SECRET.value() },
+      body: JSON.stringify({ title, description, price, category, condition,
+        photos: photos || [], sellerId: uid, locationCity, lat, lng, source: 'app' }),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) { console.warn('postToMarketplace web error', res.status, json && json.error); return { id: '', url: '' }; }
+    return { id: json.id || '', url: json.url || '' }; // url = https://zazooomit.com/listing/<id>
+  } catch (e) { console.error('postToMarketplace fetch failed', String(e)); return { id: '', url: '' }; }
+}
+
 exports.publishListingsFromDetection = onCall(
-  { region: PHOTO_REGION, memory: '1GiB', timeoutSeconds: 300 },
+  { region: PHOTO_REGION, memory: '1GiB', timeoutSeconds: 300, secrets: [APP_LISTINGS_SECRET] },
   async (request) => {
     const uid = requireAuth(request);
     const data = request.data || {};
@@ -1320,8 +1502,19 @@ exports.publishListingsFromDetection = onCall(
       const photoBuf = await sharpLib()(buffer).jpeg({ quality: 85 }).toBuffer();
       const photo_url = await savePublic(
         bucket, `listings/${uid}/${listingId}/photo.jpg`, photoBuf, 'image/jpeg');
-      const qr_url = await savePublic(
-        bucket, `listings/${uid}/${listingId}/qr.png`, await qrBuffer(listingId), 'image/png');
+
+      // SINGLE WRITER: marketplace row (active), QR from the live url.
+      const web = await postToMarketplace({
+        uid, title, description, price,
+        category: items[0] && items[0].category,
+        condition: items[0] && items[0].condition,
+        photos: [photo_url],
+      });
+      const qr_url = web.url
+        ? await savePublic(
+            bucket, `listings/${uid}/${listingId}/qr.png`,
+            await qrBuffer(web.url), 'image/png')
+        : '';
 
       await ref.set(buildListingDoc(uid, {
         title,
@@ -1333,8 +1526,8 @@ exports.publishListingsFromDetection = onCall(
         qr_url,
       }));
 
-      console.log('bundle listing created', listingId);
-      return { mode, listings: [{ listingId, photo_url, qr_url }] };
+      console.log('bundle listing created', listingId, 'web', web.id || 'none');
+      return { mode, listings: [{ listingId, photo_url, qr_url, url: web.url || '' }] };
     }
 
     // ----- SEPARATE: one listing per item, cropped to its box -----
@@ -1358,21 +1551,36 @@ exports.publishListingsFromDetection = onCall(
 
       const photo_url = await savePublic(
         bucket, `listings/${uid}/${listingId}/photo.jpg`, photoBuf, 'image/jpeg');
-      const qr_url = await savePublic(
-        bucket, `listings/${uid}/${listingId}/qr.png`, await qrBuffer(listingId), 'image/png');
+
+      const title = it.title || it.label || `Item ${i + 1}`;
+      const description = it.description || '';
+      const category = it.category;
+      const condition = it.condition;
+      const price = safeNum(it.priceEstimate != null ? it.priceEstimate : it.price);
+
+      // SINGLE WRITER: create the Supabase marketplace row (active via
+      // APP_POSTS_AUTOPUBLISH), then build the QR from its LIVE url so it never 404s.
+      const web = await postToMarketplace({
+        uid, title, description, price, category, condition, photos: [photo_url],
+      });
+      const qr_url = web.url
+        ? await savePublic(
+            bucket, `listings/${uid}/${listingId}/qr.png`,
+            await qrBuffer(web.url), 'image/png')
+        : '';
 
       await ref.set(buildListingDoc(uid, {
-        title: it.title || it.label || `Item ${i + 1}`,
-        description: it.description || '',
-        category: it.category,
-        condition: it.condition,
-        price: safeNum(it.priceEstimate != null ? it.priceEstimate : it.price),
+        title,
+        description,
+        category,
+        condition,
+        price,
         photo_url,
         qr_url,
       }));
 
-      console.log('separate listing created', listingId, i);
-      results.push({ listingId, photo_url, qr_url });
+      console.log('separate listing created', listingId, 'web', web.id || 'none');
+      results.push({ listingId, photo_url, qr_url, url: web.url || '' });
     }
 
     return { mode, listings: results };
@@ -1397,7 +1605,10 @@ exports.publishListingsFromDetection = onCall(
 // (ANTHROPIC_API_KEY), never in client code. Runs in us-east1 to match Storage.
 
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
-const SCAN_MAX_FRAMES = parseInt(process.env.SCAN_MAX_FRAMES || '20', 10);
+// STAGE 1 samples this many frames EVENLY across the clip (single photo -> 1).
+const SCAN_TARGET_FRAMES = parseInt(process.env.SCAN_TARGET_FRAMES || '6', 10);
+// Upper bound on frames pulled from ffmpeg before even-subsampling to the target.
+const SCAN_EXTRACT_CAP = parseInt(process.env.SCAN_EXTRACT_CAP || '60', 10);
 
 let _anthropic = null;
 function anthropicClient() {
@@ -1455,124 +1666,217 @@ async function extractFrames(videoBuffer, maxFrames) {
   }
 }
 
-const SCAN_PROMPT = `You are a marketplace listing assistant. The images are frames from a short video panning around a room. Identify every DISTINCT sellable physical item visible across ALL the frames combined.
+// Anthropic server-side web search tool — grounds Stage-2 pricing in live sold
+// comps. max_uses: 1 keeps each per-item pricing call to a single search.
+const WEB_SEARCH_TOOL = { type: 'web_search_20250305', name: 'web_search', max_uses: 1 };
 
-The SAME real-world object usually appears in several consecutive frames — count it ONCE. Deduplicate aggressively across frames.
-
-Return ONLY valid JSON (no markdown, no code fences, no commentary) in EXACTLY this shape:
-{
-  "items": [
-    {
-      "title": "catchy marketplace listing title",
-      "category": "one of: Electronics, Clothing, Shoes, Home, Toys, Sports, Books, Tools, Beauty, Other",
-      "condition": "one of: New, Like New, Good, Fair, Poor",
-      "priceLow": 0,
-      "priceHigh": 0
-    }
-  ]
+/** One vision/text call to Claude; returns the concatenated text output. */
+async function claudeText({ system, content, maxTokens, tools }) {
+  const msg = await anthropicClient().messages.create({
+    model: ANTHROPIC_MODEL,
+    max_tokens: maxTokens,
+    ...(system ? { system } : {}),
+    ...(tools ? { tools } : {}),
+    messages: [{ role: 'user', content }],
+  });
+  return (msg.content || [])
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text)
+    .join('');
 }
 
-Rules:
-- priceLow and priceHigh are NUMBERS in USD (no currency symbol), priceLow <= priceHigh, based on typical US used-resale values.
-- One entry per distinct real-world item. Do NOT emit the same item multiple times because it appears in multiple frames.
-- Only movable, sellable goods. Skip fixtures and built-ins (walls, floors, doors, windows, outlets, ceiling fixtures, built-in cabinets).
-- If you see nothing sellable, return {"items": []}.`;
-
-/** Normalize one model item to the strict {title,category,condition,priceLow,priceHigh} shape. */
-function normalizeScanItem(it) {
-  const CATEGORIES = ['Electronics', 'Clothing', 'Shoes', 'Home', 'Toys', 'Sports', 'Books', 'Tools', 'Beauty', 'Other'];
-  const CONDITIONS = ['New', 'Like New', 'Good', 'Fair', 'Poor'];
-  const title = (it && it.title ? String(it.title) : '').trim() || 'Untitled item';
-  const category = CATEGORIES.includes(it && it.category) ? it.category : 'Other';
-  const condition = CONDITIONS.includes(it && it.condition) ? it.condition : 'Good';
-  let low = safeNum(it && it.priceLow);
-  let high = safeNum(it && it.priceHigh, low);
-  if (high < low) { const t = low; low = high; high = t; }
-  return { title, category, condition, priceLow: low, priceHigh: high };
-}
-
-/** Safety-net dedupe by case-folded title (the model is also told to dedupe). */
-function dedupeByTitle(items) {
-  const seen = new Set();
-  const out = [];
-  for (const it of items) {
-    const key = it.title.toLowerCase().replace(/\s+/g, ' ').trim();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(it);
-  }
-  return out;
-}
-
+// ---- FUNCTION: scanItems (STAGE 1 ITEMIZE + STAGE 2 PRICE) -------------------
+//
+//   scanItems({ videoPath | mediaPath | photoPath })
+//     STAGE 1 — sample 6 frames evenly across the clip (or use the single
+//       photo) and send them in ONE Claude vision request -> distinct sellable
+//       items (name/category/quantity/is_set/condition/material/notes), then a
+//       dedupe/merge pass collapses the same item seen in multiple frames.
+//     STAGE 2 — price EACH item on its own (one call per item) with a one-line
+//       reasoned justification -> low/high/suggested/reason.
+//
+//   Returns the itemized + priced list for the UI to show the "Bundle or
+//   Single?" prompt. No ads, no writes, NO posting here — Stage 3 is the
+//   generateScanAds callable below, called once the user picks a mode.
+//
+//   Returns: { items:[{ ...stage1, low, high, suggested, reason,
+//                        title, price, priceLow, priceHigh, conditionLabel }],
+//              total, frameCount, videoPath, mediaPath, ask:'bundle_or_single',
+//              error? }
 exports.scanItems = onCall(
   { region: PHOTO_REGION, memory: '2GiB', timeoutSeconds: 300, secrets: [ANTHROPIC_API_KEY] },
   async (request) => {
     const uid = requireAuth(request);
-    const videoPath = sanitizeStoragePath(request.data && request.data.videoPath);
-    console.log('scanItems', { uid, videoPath });
+    const d = request.data || {};
+    const mediaPath = sanitizeStoragePath(d.videoPath || d.mediaPath || d.photoPath);
+    console.log('scanItems', { uid, mediaPath });
 
-    // downloadImage is a generic byte-download (name aside) — reuse it for video.
-    const { buffer } = await downloadImage(videoPath);
+    // downloadImage is a generic byte-download (name aside) — reuse for video too.
+    const { buffer, contentType } = await downloadImage(mediaPath);
+    const isVideo = !String(contentType || '').startsWith('image/');
 
+    // ---- collect frames: single photo -> [photo]; video -> 6 evenly-sampled ----
     let frames;
-    try {
-      frames = await extractFrames(buffer, SCAN_MAX_FRAMES);
-    } catch (e) {
-      console.error('frame extraction failed', String(e));
-      return { items: [], total: 0, frameCount: 0, videoPath, error: 'frame_extraction_failed' };
+    if (!isVideo) {
+      let buf = buffer;
+      try {
+        buf = await sharpLib()(buffer).rotate()
+          .resize({ width: 1024, withoutEnlargement: true })
+          .jpeg({ quality: 85 }).toBuffer();
+      } catch (e) {
+        console.warn('photo normalize failed, using raw bytes', String(e));
+      }
+      frames = [buf];
+    } else {
+      let extracted;
+      try {
+        extracted = await extractFrames(buffer, SCAN_EXTRACT_CAP);
+      } catch (e) {
+        console.error('frame extraction failed', String(e));
+        return { items: [], total: 0, frameCount: 0, videoPath: mediaPath, mediaPath, error: 'frame_extraction_failed' };
+      }
+      frames = scan.pickEvenly(extracted, SCAN_TARGET_FRAMES);
     }
-    if (frames.length === 0) {
-      return { items: [], total: 0, frameCount: 0, videoPath, error: 'no_frames' };
+    if (!frames || frames.length === 0) {
+      return { items: [], total: 0, frameCount: 0, videoPath: mediaPath, mediaPath, error: 'no_frames' };
     }
-    console.log('extracted frames', frames.length);
+    console.log('scan frames', frames.length);
 
-    let raw = '';
+    // Upload one representative still so scan-created listings have an IMAGE
+    // (a room-scan video has no photo; without this, listings save photos:[]).
+    let frameUrl = '';
+    try {
+      const fb = await sharpLib()(frames[0]).rotate()
+        .resize({ width: 1024, withoutEnlargement: true })
+        .jpeg({ quality: 85 }).toBuffer();
+      frameUrl = await savePublic(defaultBucket(),
+        `users/${uid}/scan_frames/${Date.now()}.jpg`, fb, 'image/jpeg');
+    } catch (e) {
+      console.warn('scan frame still upload failed', String(e));
+    }
+
+    // ---- STAGE 1: ITEMIZE (one vision call, all frames as ONE scene) ----
+    let parsed1;
     try {
       const content = frames.map((buf) => ({
         type: 'image',
         source: { type: 'base64', media_type: 'image/jpeg', data: buf.toString('base64') },
       }));
-      content.push({ type: 'text', text: SCAN_PROMPT });
-
-      const msg = await anthropicClient().messages.create({
-        model: ANTHROPIC_MODEL,
-        max_tokens: 2000,
-        messages: [{ role: 'user', content }],
-      });
-      raw = (msg.content || [])
-        .filter((b) => b.type === 'text')
-        .map((b) => b.text)
-        .join('');
+      content.push({ type: 'text', text: scan.STAGE1_ITEMIZE_PROMPT });
+      const raw = await claudeText({ content, maxTokens: 2000 });
+      parsed1 = scan.extractJson(raw);
     } catch (e) {
-      console.error('Claude vision failed', String(e));
-      return { items: [], total: 0, frameCount: frames.length, videoPath, error: 'vision_failed' };
+      console.error('Stage 1 itemize failed', String(e));
+      return { items: [], total: 0, frameCount: frames.length, videoPath: mediaPath, mediaPath, error: 'vision_failed' };
     }
 
-    let cleaned = raw.trim()
-      .replace(/^```(?:json)?\s*/i, '')
-      .replace(/\s*```$/i, '')
-      .trim();
-    const start = cleaned.indexOf('{');
-    const end = cleaned.lastIndexOf('}');
-    if (start !== -1 && end !== -1) cleaned = cleaned.slice(start, end + 1);
-
-    let parsed;
-    try {
-      parsed = JSON.parse(cleaned);
-    } catch (e) {
-      console.warn('scan JSON parse failed', cleaned.slice(0, 500));
-      return { items: [], total: 0, frameCount: frames.length, videoPath, error: 'parse_failed' };
+    const rawItems = Array.isArray(parsed1.items) ? parsed1.items : [];
+    const itemized = scan.mergeStage1Items(
+      rawItems.map((it, i) => scan.normalizeStage1Item(it, i)));
+    console.log('stage1 items', { raw: rawItems.length, merged: itemized.length });
+    if (itemized.length === 0) {
+      return { items: [], total: 0, frameCount: frames.length, videoPath: mediaPath, mediaPath, ask: 'bundle_or_single' };
     }
 
-    const rawItems = Array.isArray(parsed.items) ? parsed.items : [];
-    const items = dedupeByTitle(rawItems.map(normalizeScanItem));
-    // "≈ $total" on the results screen = sum of each item's midpoint price.
-    const total = Math.round(
-      items.reduce((acc, it) => acc + (it.priceLow + it.priceHigh) / 2, 0),
-    );
-    console.log('scan items', { detected: rawItems.length, deduped: items.length, total });
+    // ---- STAGE 2: PRICE EACH ITEM (one call per item, with reasoning) ----
+    const priced = await Promise.all(itemized.map(async (item) => {
+      try {
+        const raw = await claudeText({
+          content: scan.buildStage2PricePrompt(item),
+          maxTokens: 1500,
+          tools: [WEB_SEARCH_TOOL],
+        });
+        return scan.mergeItemWithPrice(item, scan.normalizeStage2Price(raw, item));
+      } catch (e) {
+        console.warn('Stage 2 pricing failed for', item.id, String(e));
+        return scan.mergeItemWithPrice(item, { low: 0, high: 0, suggested: 0, reason: '' });
+      }
+    }));
 
-    return { items, total, frameCount: frames.length, videoPath };
+    // Highest suggested value first (Home Scan results order — same as the web).
+    priced.sort((a, b) => (b.suggested || 0) - (a.suggested || 0));
+
+    const total = scan.computeTotal(priced);
+    console.log('scan complete', { items: priced.length, total });
+
+    // STAGE 3 (ASK "Bundle or Single?") is a UI decision; the app then calls
+    // generateScanAds with the chosen mode. Nothing is posted here.
+    return {
+      items: priced, total, frameCount: frames.length,
+      videoPath: mediaPath, mediaPath, frameUrl, ask: 'bundle_or_single',
+    };
+  },
+);
+
+// ---- FUNCTION: generateScanAds (STAGE 3 — ASK + BRANCH ad generation) --------
+//
+//   generateScanAds({ mode:'bundle'|'single', items:[priced], bundleDiscount? })
+//     BUNDLE -> ONE polished ad covering all items + a combined price
+//               (combined_price = sum of suggested; optional 10% bundle discount).
+//     SINGLE -> ONE polished ad PER item, each with its own price.
+//
+//   Returns editable ad DRAFTS only. NOTHING is posted — the app shows a confirm
+//   screen, lets the user edit each ad, then calls postListing (BUNDLE: once;
+//   SINGLE: once per ad).
+//
+//   BUNDLE returns: { mode, combined_price, subtotal, discount_applied,
+//                     ad:{title,description,bullets,price,category,condition},
+//                     editable:true }
+//   SINGLE returns: { mode, ads:[{...ad, sourceId, category, condition}],
+//                     editable:true }
+exports.generateScanAds = onCall(
+  { region: PHOTO_REGION, memory: '1GiB', timeoutSeconds: 300, secrets: [ANTHROPIC_API_KEY] },
+  async (request) => {
+    const uid = requireAuth(request);
+    const data = request.data || {};
+    const mode = data.mode === 'bundle' ? 'bundle' : 'single';
+    const bundleDiscount = data.bundleDiscount === true;
+    const items = Array.isArray(data.items) ? data.items : [];
+    if (items.length === 0) {
+      throw new HttpsError('invalid-argument', 'items[] must be non-empty.');
+    }
+    console.log('generateScanAds', { uid, mode, count: items.length, bundleDiscount });
+
+    // ----- BUNDLE: one ad, combined price (optional 10% discount toggle) -----
+    if (mode === 'bundle') {
+      const { subtotal, price, discount_applied } = scan.computeBundlePrice(items, bundleDiscount);
+      let ad;
+      try {
+        const raw = await claudeText({ content: scan.buildBundleAdPrompt(items), maxTokens: 1200 });
+        ad = scan.normalizeAd(raw, { title: `Bundle: ${items.length} items`, price });
+      } catch (e) {
+        console.error('bundle ad generation failed', String(e));
+        ad = {
+          title: `Bundle: ${items.length} items`, description: '',
+          bullets: items.map(scan.bulletFor), price,
+        };
+      }
+      // Computed bundle price is authoritative (honors the 10% toggle).
+      ad.price = price;
+      ad.category = (items[0] && items[0].category) || 'Other';
+      ad.condition = (items[0] && (items[0].conditionLabel || items[0].condition)) || 'Good';
+      return { mode, combined_price: price, subtotal, discount_applied, ad, editable: true };
+    }
+
+    // ----- SINGLE: one editable ad per item -----
+    const ads = await Promise.all(items.map(async (item) => {
+      const fallbackPrice = scan.safeNum(item.suggested != null ? item.suggested : item.price, 0);
+      let ad;
+      try {
+        const raw = await claudeText({ content: scan.buildSingleAdPrompt(item), maxTokens: 700 });
+        ad = scan.normalizeAd(raw, { title: item.name || item.title, price: fallbackPrice });
+      } catch (e) {
+        console.warn('single ad generation failed for', item.id, String(e));
+        ad = { title: item.name || item.title || 'Item', description: '', bullets: [], price: fallbackPrice };
+      }
+      if (!ad.price) ad.price = fallbackPrice;
+      ad.sourceId = item.id;
+      ad.category = item.category || 'Other';
+      ad.condition = item.conditionLabel || scan.conditionLabel(item.condition) || 'Good';
+      return ad;
+    }));
+
+    return { mode, ads, editable: true };
   },
 );
 
