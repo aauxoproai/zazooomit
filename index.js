@@ -1546,7 +1546,7 @@ exports.publishListingsFromDetection = onCall(
     const data = request.data || {};
     const storagePath = sanitizeStoragePath(data.storagePath);
     const mode = data.mode === 'bundle' ? 'bundle' : 'separate';
-    const items = Array.isArray(data.items) ? data.items : [];
+    let items = Array.isArray(data.items) ? data.items : [];
     // Per-publish-action idempotency key — appended with the item index (or
     // '#bundle') so each row is unique within ONE publish, while a re-fired
     // publish reproduces the SAME keys and the unique index dedupes them.
@@ -1558,7 +1558,22 @@ exports.publishListingsFromDetection = onCall(
       ? data.photos.filter((u) => typeof u === 'string' && /^https?:\/\//.test(u))
       : [];
     if (items.length === 0) {
-      throw new HttpsError('invalid-argument', 'items[] must be non-empty.');
+      // BUNDLE from the multi-item review clears detectedItems and drives the
+      // listing purely from bundleTitle/Price/Description — so an empty items[]
+      // is valid for bundle mode. Synthesize a single item from those fields so
+      // the bundle still lists instead of rejecting ("Couldn't post"). Separate
+      // mode still requires real items.
+      if (mode === 'bundle' && data.bundleTitle && String(data.bundleTitle).trim()) {
+        items = [{
+          title: String(data.bundleTitle).trim(),
+          description: data.bundleDescription ? String(data.bundleDescription) : '',
+          category: '',
+          condition: '',
+          priceEstimate: data.bundlePrice != null ? safeNum(data.bundlePrice) : 0,
+        }];
+      } else {
+        throw new HttpsError('invalid-argument', 'items[] must be non-empty.');
+      }
     }
     console.log('publishListingsFromDetection', { uid, mode, count: items.length });
 
