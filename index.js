@@ -1360,7 +1360,11 @@ exports.detectItemsFromPhoto = onCall(
           break;
         } catch (e) {
           lastErr = e;
-          const transient = /\b(50[0-9]|429)\b|unavailable|high demand|overload|quota|rate.?limit/i
+          // Only retry genuinely transient server errors (503/overload). A 429
+          // quota / prepay-depleted / rate-limit will NOT recover in a few
+          // seconds — retrying just burns ~15s and blows the client timeout, so
+          // fail fast straight to the Claude fallback instead.
+          const transient = /\b50[0-9]\b|unavailable|high demand|overload/i
               .test(String(e));
           if (!transient) throw e;
           console.warn(`Gemini transient error (attempt ${attempt + 1}/4), retrying`, String(e));
@@ -1375,8 +1379,27 @@ exports.detectItemsFromPhoto = onCall(
         .map((p) => p.text || '')
         .join('');
     } catch (e) {
-      console.error('Gemini generateContent failed', String(e));
-      return { items: [], storagePath, width, height, error: 'vision_failed' };
+      // Gemini unavailable (429 / quota / prepay-depleted / 503). FALL BACK to
+      // Claude vision so the user still gets a real ad instead of a blank one —
+      // same DETECT_PROMPT / JSON contract, so the parse + pricing below are
+      // unchanged. ANTHROPIC_API_KEY is already a secret on this function.
+      console.error('Gemini generateContent failed, falling back to Claude vision', String(e));
+      try {
+        const mt = /^image\/(jpe?g|png|gif|webp)$/i.test(contentType)
+          ? contentType.toLowerCase()
+          : 'image/jpeg';
+        raw = await claudeText({
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mt, data: buffer.toString('base64') } },
+            { type: 'text', text: DETECT_PROMPT },
+          ],
+          maxTokens: 2048,
+        });
+        console.log('Claude vision fallback OK');
+      } catch (e2) {
+        console.error('Claude vision fallback also failed', String(e2));
+        return { items: [], storagePath, width, height, error: 'vision_failed' };
+      }
     }
 
     // Strip code fences defensively, then parse.
