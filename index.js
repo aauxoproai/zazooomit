@@ -1269,6 +1269,11 @@ function boxToExtract(box, width, height) {
 
 /** Build a `listings` doc payload conforming to the live hardened schema. */
 function buildListingDoc(uid, f) {
+  // Prefer the full captured-photo gallery (all angles the user shot); fall
+  // back to the single server-cropped cover for legacy callers.
+  const photos = (Array.isArray(f.photos) && f.photos.length)
+    ? f.photos
+    : [f.photo_url];
   return {
     seller_id: uid,
     title: f.title,
@@ -1276,8 +1281,8 @@ function buildListingDoc(uid, f) {
     category: f.category || 'Other',
     condition: f.condition || 'Good',
     price: f.price,
-    photos: [f.photo_url],      // list — what the app feed reads
-    photo_url: f.photo_url,     // convenience mirror (Admin-written)
+    photos: photos,             // list — what the app feed reads (all photos)
+    photo_url: f.photo_url,     // cropped-cover mirror (Admin-written)
     qr_url: f.qr_url,
     status: 'active',           // lowercase — required by firestore.rules
     view_count: 0,
@@ -1450,13 +1455,13 @@ exports.detectItemsFromPhoto = onCall(
 // if the web POST fails we keep the Firestore mirror and return no url. The web
 // route authenticates via x-app-secret and writes Supabase with the service-role
 // key (server-side); status is 'active' once APP_POSTS_AUTOPUBLISH=true.
-async function postToMarketplace({ uid, title, description, price, category, condition, photos, locationCity, lat, lng }) {
+async function postToMarketplace({ uid, title, description, price, category, condition, photos, locationCity, lat, lng, publishKey }) {
   try {
     const res = await fetch(WEB_API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-app-secret': APP_LISTINGS_SECRET.value() },
       body: JSON.stringify({ title, description, price, category, condition,
-        photos: photos || [], sellerId: uid, locationCity, lat, lng, source: 'app' }),
+        photos: photos || [], sellerId: uid, locationCity, lat, lng, source: 'app', publishKey }),
     });
     const json = await res.json().catch(() => ({}));
     if (!res.ok) { console.warn('postToMarketplace web error', res.status, json && json.error); return { id: '', url: '' }; }
@@ -1472,6 +1477,16 @@ exports.publishListingsFromDetection = onCall(
     const storagePath = sanitizeStoragePath(data.storagePath);
     const mode = data.mode === 'bundle' ? 'bundle' : 'separate';
     const items = Array.isArray(data.items) ? data.items : [];
+    // Per-publish-action idempotency key — appended with the item index (or
+    // '#bundle') so each row is unique within ONE publish, while a re-fired
+    // publish reproduces the SAME keys and the unique index dedupes them.
+    const publishKey = data.publishKey ? String(data.publishKey) : null;
+    // Full gallery of photos the client uploaded (all captured angles). Stored
+    // as the listing's `photos` array; falls back to the server-cropped cover
+    // when the client sends none (older app builds).
+    const clientPhotos = Array.isArray(data.photos)
+      ? data.photos.filter((u) => typeof u === 'string' && /^https?:\/\//.test(u))
+      : [];
     if (items.length === 0) {
       throw new HttpsError('invalid-argument', 'items[] must be non-empty.');
     }
@@ -1502,13 +1517,17 @@ exports.publishListingsFromDetection = onCall(
       const photoBuf = await sharpLib()(buffer).jpeg({ quality: 85 }).toBuffer();
       const photo_url = await savePublic(
         bucket, `listings/${uid}/${listingId}/photo.jpg`, photoBuf, 'image/jpeg');
+      // Bundle = one item photographed from several angles -> attach EVERY
+      // captured photo, not just the cropped cover.
+      const galleryPhotos = clientPhotos.length ? clientPhotos : [photo_url];
 
       // SINGLE WRITER: marketplace row (active), QR from the live url.
       const web = await postToMarketplace({
         uid, title, description, price,
         category: items[0] && items[0].category,
         condition: items[0] && items[0].condition,
-        photos: [photo_url],
+        photos: galleryPhotos,
+        publishKey: publishKey ? `${publishKey}#bundle` : null,
       });
       const qr_url = web.url
         ? await savePublic(
@@ -1523,11 +1542,12 @@ exports.publishListingsFromDetection = onCall(
         condition: items[0] && items[0].condition,
         price,
         photo_url,
+        photos: galleryPhotos,
         qr_url,
       }));
 
-      console.log('bundle listing created', listingId, 'web', web.id || 'none');
-      return { mode, listings: [{ listingId, photo_url, qr_url, url: web.url || '' }] };
+      console.log('bundle listing created', listingId, 'web', web.id || 'none', 'photos', galleryPhotos.length);
+      return { mode, listings: [{ listingId, photo_url, photos: galleryPhotos, qr_url, url: web.url || '' }] };
     }
 
     // ----- SEPARATE: one listing per item, cropped to its box -----
@@ -1558,10 +1578,17 @@ exports.publishListingsFromDetection = onCall(
       const condition = it.condition;
       const price = safeNum(it.priceEstimate != null ? it.priceEstimate : it.price);
 
+      // Single detected item => all captured photos belong to it. Multi-item
+      // => keep the per-item cropped cover only (raw angles are ambiguous).
+      const galleryPhotos = (items.length === 1 && clientPhotos.length)
+        ? clientPhotos
+        : [photo_url];
+
       // SINGLE WRITER: create the Supabase marketplace row (active via
       // APP_POSTS_AUTOPUBLISH), then build the QR from its LIVE url so it never 404s.
       const web = await postToMarketplace({
-        uid, title, description, price, category, condition, photos: [photo_url],
+        uid, title, description, price, category, condition, photos: galleryPhotos,
+        publishKey: publishKey ? `${publishKey}#${i}` : null,
       });
       const qr_url = web.url
         ? await savePublic(
@@ -1576,11 +1603,12 @@ exports.publishListingsFromDetection = onCall(
         condition,
         price,
         photo_url,
+        photos: galleryPhotos,
         qr_url,
       }));
 
-      console.log('separate listing created', listingId, 'web', web.id || 'none');
-      results.push({ listingId, photo_url, qr_url, url: web.url || '' });
+      console.log('separate listing created', listingId, 'web', web.id || 'none', 'photos', galleryPhotos.length);
+      results.push({ listingId, photo_url, photos: galleryPhotos, qr_url, url: web.url || '' });
     }
 
     return { mode, listings: results };
@@ -1913,6 +1941,7 @@ exports.postListing = onCall(
       lat: d.lat,
       lng: d.lng,
       source: 'app',
+      publishKey: d.publishKey || null,
     };
 
     let res;
