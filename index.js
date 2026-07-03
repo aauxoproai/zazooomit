@@ -1292,7 +1292,7 @@ function buildListingDoc(uid, f) {
 
 // ---- FUNCTION 1: detectItemsFromPhoto ---------------------------------------
 
-const DETECT_PROMPT = `You are a marketplace listing assistant. Look at the image and identify each distinct sellable physical item.
+const DETECT_PROMPT = `You are a marketplace listing assistant. Look at the image and identify EVERY distinct sellable physical item you can see. Be thorough: a typical desk, shelf, or room photo contains several separate items — include smaller or partially-visible ones, and return a SEPARATE entry for each. Do NOT merge different items into one, and do NOT invent items that are not clearly visible.
 
 Return ONLY valid JSON (no markdown, no code fences, no commentary) in EXACTLY this shape:
 {
@@ -1314,6 +1314,43 @@ Rules:
 - box coordinates are integers normalized 0-1000 with origin at the TOP-LEFT (Gemini convention): ymin/xmin = top-left corner, ymax/xmax = bottom-right corner.
 - One entry per distinct item. If only one item, return one entry.
 - If you see no sellable item, return {"items": []}.`;
+
+/**
+ * Salvage every COMPLETE {...} item object from a truncated/malformed items
+ * JSON array (e.g. the model hit max_tokens mid-array). Walks brace depth,
+ * ignoring braces inside strings, and JSON.parses each closed object; a
+ * truncated final object is simply skipped. Returns [] if nothing usable.
+ */
+function salvageItems(text) {
+  const arrStart = text.indexOf('[', text.indexOf('"items"'));
+  if (arrStart < 0) return [];
+  const out = [];
+  let depth = 0;
+  let objStart = -1;
+  let inStr = false;
+  let esc = false;
+  for (let i = arrStart + 1; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') { if (depth === 0) objStart = i; depth++; }
+    else if (c === '}') {
+      depth--;
+      if (depth === 0 && objStart >= 0) {
+        try { out.push(JSON.parse(text.slice(objStart, i + 1))); } catch (_) { /* skip */ }
+        objStart = -1;
+      }
+    } else if (c === ']' && depth === 0) {
+      break;
+    }
+  }
+  return out;
+}
 
 exports.detectItemsFromPhoto = onCall(
   // GEMINI for detection + boxes; ANTHROPIC for the Stage-2 web_search SOLD-comps
@@ -1393,7 +1430,10 @@ exports.detectItemsFromPhoto = onCall(
             { type: 'image', source: { type: 'base64', media_type: mt, data: buffer.toString('base64') } },
             { type: 'text', text: DETECT_PROMPT },
           ],
-          maxTokens: 2048,
+          // 8192 (Claude max output): a 10-item response with per-item
+          // description + box is large; 2048 truncated it mid-array, which the
+          // JSON parser then dropped to ~1 garbage item at $0.
+          maxTokens: 8192,
         });
         console.log('Claude vision fallback OK');
       } catch (e2) {
@@ -1412,8 +1452,15 @@ exports.detectItemsFromPhoto = onCall(
     try {
       parsed = JSON.parse(cleaned);
     } catch (e) {
-      console.warn('JSON parse failed', cleaned.slice(0, 500));
-      return { items: [], storagePath, width, height, error: 'parse_failed' };
+      // Truncated/malformed JSON — salvage the complete items instead of
+      // dropping the whole scan to a single garbage $0 item.
+      const salvaged = salvageItems(cleaned);
+      if (salvaged.length === 0) {
+        console.warn('JSON parse failed, nothing salvageable', cleaned.slice(0, 500));
+        return { items: [], storagePath, width, height, error: 'parse_failed' };
+      }
+      console.log('JSON parse failed; salvaged items from truncated response', salvaged.length);
+      parsed = { items: salvaged };
     }
 
     const items = Array.isArray(parsed.items) ? parsed.items : [];
