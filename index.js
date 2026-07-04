@@ -1315,42 +1315,8 @@ Rules:
 - One entry per distinct item. If only one item, return one entry.
 - If you see no sellable item, return {"items": []}.`;
 
-/**
- * Salvage every COMPLETE {...} item object from a truncated/malformed items
- * JSON array (e.g. the model hit max_tokens mid-array). Walks brace depth,
- * ignoring braces inside strings, and JSON.parses each closed object; a
- * truncated final object is simply skipped. Returns [] if nothing usable.
- */
-function salvageItems(text) {
-  const arrStart = text.indexOf('[', text.indexOf('"items"'));
-  if (arrStart < 0) return [];
-  const out = [];
-  let depth = 0;
-  let objStart = -1;
-  let inStr = false;
-  let esc = false;
-  for (let i = arrStart + 1; i < text.length; i++) {
-    const c = text[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (c === '\\') esc = true;
-      else if (c === '"') inStr = false;
-      continue;
-    }
-    if (c === '"') { inStr = true; continue; }
-    if (c === '{') { if (depth === 0) objStart = i; depth++; }
-    else if (c === '}') {
-      depth--;
-      if (depth === 0 && objStart >= 0) {
-        try { out.push(JSON.parse(text.slice(objStart, i + 1))); } catch (_) { /* skip */ }
-        objStart = -1;
-      }
-    } else if (c === ']' && depth === 0) {
-      break;
-    }
-  }
-  return out;
-}
+// salvageItems() lives in scan_pipeline.js (scan.salvageItems) so it is
+// unit-testable without loading the functions runtime. See test/salvage_items.test.js.
 
 exports.detectItemsFromPhoto = onCall(
   // GEMINI for detection + boxes; ANTHROPIC for the Stage-2 web_search SOLD-comps
@@ -1454,7 +1420,7 @@ exports.detectItemsFromPhoto = onCall(
     } catch (e) {
       // Truncated/malformed JSON — salvage the complete items instead of
       // dropping the whole scan to a single garbage $0 item.
-      const salvaged = salvageItems(cleaned);
+      const salvaged = scan.salvageItems(cleaned);
       if (salvaged.length === 0) {
         console.warn('JSON parse failed, nothing salvageable', cleaned.slice(0, 500));
         return { items: [], storagePath, width, height, error: 'parse_failed' };
@@ -1877,21 +1843,57 @@ exports.scanItems = onCall(
     }
 
     // ---- STAGE 1: ITEMIZE (one vision call, all frames as ONE scene) ----
-    let parsed1;
-    try {
-      const content = frames.map((buf) => ({
-        type: 'image',
-        source: { type: 'base64', media_type: 'image/jpeg', data: buf.toString('base64') },
-      }));
-      content.push({ type: 'text', text: scan.STAGE1_ITEMIZE_PROMPT });
-      const raw = await claudeText({ content, maxTokens: 2000 });
-      parsed1 = scan.extractJson(raw);
-    } catch (e) {
-      console.error('Stage 1 itemize failed', String(e));
+    // Busy scenes (15-20+ items) can overflow the model's output budget and
+    // truncate the itemize JSON mid-array. A plain parse then throws and the
+    // WHOLE scan is lost (SyntaxError ... position N -> "what you can sell" hang).
+    // Three-part hardening: (1) generous max_tokens headroom; (2) if the strict
+    // parse fails, SALVAGE every COMPLETE {...} item from the partial output
+    // (salvageItems) instead of dropping the scan; (3) retry the vision call once
+    // when we got nothing usable. A clean parse that legitimately returns []
+    // (empty scene) is respected and NOT retried.
+    const stage1Content = frames.map((buf) => ({
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/jpeg', data: buf.toString('base64') },
+    }));
+    stage1Content.push({ type: 'text', text: scan.STAGE1_ITEMIZE_PROMPT });
+
+    const parseStage1 = (raw) => {
+      try {
+        const p = scan.extractJson(raw);
+        if (p && Array.isArray(p.items)) return { items: p.items, clean: true };
+      } catch (_) { /* truncated/malformed -> salvage below */ }
+      return { items: scan.salvageItems(raw), clean: false };
+    };
+
+    let rawItems = [];
+    let stage1Err = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const raw = await claudeText({ content: stage1Content, maxTokens: 8000 });
+        const { items, clean } = parseStage1(raw);
+        rawItems = items;
+        if (!clean && items.length > 0) {
+          // Salvage path hit -> the model's JSON was truncated/malformed but we
+          // recovered the complete items. WARN with payload size so silent
+          // truncation stays visible in logs/alerting instead of degrading quietly.
+          console.warn('scanItems Stage-1 SALVAGE parse (truncated vision JSON)', {
+            attempt, rawChars: String(raw == null ? '' : raw).length, salvaged: items.length,
+          });
+        }
+        // Done when the model parsed cleanly (even if empty) or salvage recovered
+        // at least one item; only an unparseable+empty result triggers a retry.
+        if (clean || items.length > 0) { stage1Err = null; break; }
+        console.warn('Stage 1 itemize unparseable, retrying', { attempt });
+        stage1Err = new Error('stage1_unparseable');
+      } catch (e) {
+        stage1Err = e;
+        console.error('Stage 1 itemize call failed', { attempt, err: String(e) });
+      }
+    }
+    if (rawItems.length === 0 && stage1Err) {
+      console.error('Stage 1 itemize failed', String(stage1Err));
       return { items: [], total: 0, frameCount: frames.length, videoPath: mediaPath, mediaPath, error: 'vision_failed' };
     }
-
-    const rawItems = Array.isArray(parsed1.items) ? parsed1.items : [];
     const itemized = scan.mergeStage1Items(
       rawItems.map((it, i) => scan.normalizeStage1Item(it, i)));
     console.log('stage1 items', { raw: rawItems.length, merged: itemized.length });

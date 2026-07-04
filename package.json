@@ -25,6 +25,7 @@
     "shell": "firebase functions:shell",
     "logs": "firebase functions:log",
     "test": "node --test",
+    "predeploy": "node --test",
     "deploy": "firebase deploy --only functions"
   },
   "private": true

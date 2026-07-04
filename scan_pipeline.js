@@ -337,6 +337,46 @@ function normalizeAd(raw, fallback) {
   return { title, description, bullets, price };
 }
 
+/**
+ * Salvage every COMPLETE {...} item object from a truncated/malformed items
+ * JSON array (e.g. the model hit max_tokens mid-array, producing
+ * "SyntaxError: Expected ',' or ']' after array element"). Walks brace depth,
+ * ignoring braces inside strings, and JSON.parses each closed object; a
+ * truncated final object is simply skipped. Returns [] if nothing usable.
+ */
+function salvageItems(text) {
+  const s = String(text == null ? '' : text);
+  const itemsAt = s.indexOf('"items"');
+  const arrStart = s.indexOf('[', itemsAt < 0 ? 0 : itemsAt);
+  if (arrStart < 0) return [];
+  const out = [];
+  let depth = 0;
+  let objStart = -1;
+  let inStr = false;
+  let esc = false;
+  for (let i = arrStart + 1; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') { if (depth === 0) objStart = i; depth++; }
+    else if (c === '}') {
+      depth--;
+      if (depth === 0 && objStart >= 0) {
+        try { out.push(JSON.parse(s.slice(objStart, i + 1))); } catch (_) { /* skip truncated */ }
+        objStart = -1;
+      }
+    } else if (c === ']' && depth === 0) {
+      break;
+    }
+  }
+  return out;
+}
+
 module.exports = {
   CATEGORIES,
   CONDITIONS,
@@ -347,6 +387,7 @@ module.exports = {
   safeNum,
   pickEvenly,
   extractJson,
+  salvageItems,
   normalizeCategory,
   normalizeCondition,
   conditionLabel,
