@@ -1560,12 +1560,18 @@ exports.publishListingsFromDetection = onCall(
     if (items.length === 0) {
       // BUNDLE from the multi-item review clears detectedItems and drives the
       // listing purely from bundleTitle/Price/Description — so an empty items[]
-      // is valid for bundle mode. Synthesize a single item from those fields so
-      // the bundle still lists instead of rejecting ("Couldn't post"). Separate
-      // mode still requires real items.
-      if (mode === 'bundle' && data.bundleTitle && String(data.bundleTitle).trim()) {
+      // is valid for bundle mode. The shipped client (call_publish_listings.dart)
+      // OMITS bundleTitle entirely whenever the draft title is empty (the common
+      // case: the bundle flow never populates listingDraftTitle, or the slow scan
+      // hadn't filled it in yet), while still relying on the server to synthesize
+      // the bundle. Hinging the fallback on bundleTitle being present therefore
+      // 400s ("Couldn't post") on the real path. Synthesize a single item from
+      // whatever bundle fields arrived, defaulting the title, so a bundle ALWAYS
+      // lists. Separate mode still requires real items.
+      if (mode === 'bundle') {
+        const bt = data.bundleTitle && String(data.bundleTitle).trim();
         items = [{
-          title: String(data.bundleTitle).trim(),
+          title: bt || 'Bundle',
           description: data.bundleDescription ? String(data.bundleDescription) : '',
           category: '',
           condition: '',
@@ -1594,7 +1600,9 @@ exports.publishListingsFromDetection = onCall(
       const sum = items.reduce((acc, it) => acc + safeNum(it.priceEstimate != null ? it.priceEstimate : it.price), 0);
 
       const title = (data.bundleTitle && String(data.bundleTitle).trim())
-        || `Bundle: ${items.length} items`;
+        || (items.length === 1
+              ? String(items[0].title || 'Bundle')
+              : `Bundle: ${items.length} items`);
       const description = (data.bundleDescription && String(data.bundleDescription).trim())
         || lines.join('\n');
       const price = data.bundlePrice != null ? safeNum(data.bundlePrice) : sum;
