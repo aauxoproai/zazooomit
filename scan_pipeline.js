@@ -49,7 +49,7 @@ valid JSON, no prose, no markdown:
 function buildStage2PricePrompt(item) {
   const itemJson = JSON.stringify(item);
   return `Given this item: ${itemJson}, and that the seller is in South Florida (used resale market):
-Price a SINGLE UNIT (one piece) of this item — if quantity > 1, still price just ONE unit; the app multiplies by quantity. Search recent SOLD/completed resale listings for this exact item (prefer eBay sold listings, then Facebook Marketplace and OfferUp). Base the PER-UNIT price on what comparable items in similar condition ACTUALLY SOLD for in the US, adjusted for South Florida and the item's condition. Return ONLY JSON (all values PER UNIT): {"id":"","low":0,"high":0,"suggested":0,"reason":"one short sentence citing condition and typical local resale range","comp_basis":"one-line note of what comps you found (e.g. 'eBay sold $90-140 for similar aluminium bistro sets')"}. If no comps are found, set comp_basis to 'no comps found — model estimate' so the UI can flag it. Price realistically for a fast local sale, not retail.`;
+Price a SINGLE UNIT (one piece) of this item — if quantity > 1, still price just ONE unit; the app multiplies by quantity. Search recent SOLD/completed resale listings for this exact item (prefer eBay sold listings, then Facebook Marketplace and OfferUp). Base the PER-UNIT price on what comparable items in similar condition ACTUALLY SOLD for in the US, adjusted for South Florida and the item's condition. Return ONLY JSON (all values PER UNIT): {"id":"","low":0,"high":0,"suggested":0,"confidence":"low|medium|high","reason":"one or two short sentences citing condition and typical local resale range","comp_basis":"one-line note of what comps you found (e.g. 'eBay sold $90-140 for similar aluminium bistro sets')"}. confidence is your certainty in this price: 'high' = several close, recent sold comps; 'medium' = few or loosely-matching comps; 'low' = little or no comp data (estimate). If no comps are found, set confidence to 'low' and comp_basis to 'no comps found — model estimate' so the UI can flag it. Price realistically for a fast local sale, not retail.`;
 }
 
 // Ad copy is TEXT-ONLY: serialize ONLY the text essentials, never the whole item
@@ -70,13 +70,13 @@ function adItemText(it) {
 // together at one price, and give the bundle a catchy name.
 function buildBundleAdPrompt(itemsWithPrices) {
   const payload = JSON.stringify((itemsWithPrices || []).map(adItemText));
-  return `Write a high-converting marketplace listing for a BUNDLE of items sold together: ${payload}. You are a great salesperson making a buyer WANT the whole set. (1) punchy benefit-led title — give the bundle a catchy name; (2) warm 3-5 sentence description: open with the best thing, paint how they'll enjoy it, sell the value of taking the whole set together at one price, frame the price as a smart grab vs retail; (3) 3-5 short feature/benefit bullets. State condition honestly but briefly and POSITIVELY; never lead with flaws; mention wear once, factually, as why the price is a steal. Never invent features or falsely claim like-new. Tone: confident, friendly, exciting. Return ONLY JSON {"title":"","description":"","bullets":[],"price":0}.`;
+  return `Write a high-converting marketplace listing for a BUNDLE of items sold together: ${payload}. You are a great salesperson making a buyer WANT the whole set. (1) punchy benefit-led title — give the bundle a catchy name; (2) warm 3-5 sentence description: open with the best thing, paint how they'll enjoy it, sell the value of taking the whole set together at one price, convey it's great value in words (without stating any dollar amount); (3) 3-5 short feature/benefit bullets. State condition honestly but briefly and POSITIVELY; never lead with flaws; mention wear once, factually. Never invent features or falsely claim like-new. CRITICAL: do NOT write any dollar amount in the title, description, or bullets — no retail or "replicate at retail" price, no bundle total, no savings/discount figure. The listing displays its own price separately, so any number you state risks conflicting with it; sell the value in words only. Tone: confident, friendly, exciting. Return ONLY JSON {"title":"","description":"","bullets":[],"price":0}.`;
 }
 
 // STAGE 3 — SINGLE ad (one call per item). {item+price} is substituted.
 function buildSingleAdPrompt(item) {
   const payload = JSON.stringify(adItemText(item));
-  return `Write a high-converting marketplace listing for ONE item: ${payload}. You are a great salesperson making a buyer WANT it. (1) punchy benefit-led title; (2) warm 3-5 sentence description: open with the best thing, paint how they'll enjoy it, frame the price as a smart grab vs retail; (3) 3-5 short feature/benefit bullets. State condition honestly but briefly and POSITIVELY; never lead with flaws; mention wear once, factually, as why the price is a steal. Never invent features or falsely claim like-new. Tone: confident, friendly, exciting. Return ONLY JSON {"title":"","description":"","bullets":[],"price":0}.`;
+  return `Write a high-converting marketplace listing for ONE item: ${payload}. You are a great salesperson making a buyer WANT it. (1) punchy benefit-led title; (2) warm 3-5 sentence description: open with the best thing, paint how they'll enjoy it, convey it's great value in words (without stating any dollar amount); (3) 3-5 short feature/benefit bullets. State condition honestly but briefly and POSITIVELY; never lead with flaws; mention wear once, factually. Never invent features or falsely claim like-new. CRITICAL: do NOT write any dollar amount in the title, description, or bullets — no retail or "replicate at retail" price, no bundle total, no savings/discount figure. The listing displays its own price separately, so any number you state risks conflicting with it; sell the value in words only. Tone: confident, friendly, exciting. Return ONLY JSON {"title":"","description":"","bullets":[],"price":0}.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +260,14 @@ function normalizeStage2Price(raw, item) {
     + `${positionDesc(pos)} of the comp range; listed +~${pct}% for negotiation room.`
     + (modelReason ? ` ${modelReason}` : '');
   const comp_basis = (p.comp_basis != null ? String(p.comp_basis) : '').trim();
-  return { low, high, comp_value, per_item_price, suggested, comp_value_total, reason, comp_basis };
+  // Price-confidence for the card. Trust the model's 'low'|'medium'|'high';
+  // if missing/garbage default to 'medium' (never 'high' unprompted), or 'low'
+  // when comp_basis says there were no comps. A missing field can't crash.
+  const rawConf = String(p.confidence || '').trim().toLowerCase();
+  const confidence = ['low', 'medium', 'high'].includes(rawConf)
+    ? rawConf
+    : (/no comps found/.test(comp_basis.toLowerCase()) ? 'low' : 'medium');
+  return { low, high, comp_value, per_item_price, suggested, comp_value_total, reason, comp_basis, confidence };
 }
 
 /**

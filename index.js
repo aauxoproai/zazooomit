@@ -115,48 +115,52 @@ setGlobalOptions({ region: 'us-central1', maxInstances: 10 });
 // Supabase project REST base (public URL — not a secret).
 const SUPABASE_URL = 'https://rilyitrvilprhtxlocgc.supabase.co';
 
-/// One-time signup credit, written SERVER-SIDE for EVERY new account regardless
-/// of provider (Google, email/password, Apple, anonymous). onCreate fires exactly
-/// once per account, so this is the provider-agnostic equivalent of the website's
-/// handle_new_user() trigger (which only fires for Supabase auth.users rows).
+/// One-time free-signup credit, written SERVER-SIDE for EVERY new account
+/// regardless of provider (Google, email/password, Apple, anonymous). onCreate
+/// fires exactly once per account, so this is the provider-agnostic equivalent of
+/// the website's handle_new_user() trigger (which only fires for Supabase
+/// auth.users rows, never for Firebase/TPA app users).
 ///
-/// ⚠️ This used to INSERT into credits_ledger directly. It must not: a raw
-/// free_signup row made the uid look like a pre-existing account to
-/// claim_signup_bonus(), whose guard then returned 'existing' and made the
-/// Founders-1000 branch unreachable for every user (0 slots claimed, ever).
-/// The single grant point is now the DB function, which owns the +1-vs-top-up
-/// decision atomically. See sql/founders_1000.sql.
-///
-/// p_is_anonymous is passed so the DB can never award a founders slot from this
-/// path. Anonymous accounts keep the +1 (product decision) but must never consume
-/// a promo slot — a slot is claimed later, at the real signup/linking event, by
-/// /auth/session. providerData is empty for anonymous accounts.
+/// Idempotent + replay-proof with the SAME guarantee as POST /api/credits/grant:
+/// idempotency_key = 'free_signup:<uid>' + the UNIQUE index credits_ledger_idem_uidx.
+/// A duplicate insert returns HTTP 409, which we treat as already-granted. So a
+/// uid can only ever receive this grant once — even though the app ALSO calls
+/// grantFreeSignup() on some paths (both collapse to one row via the same key).
 ///
 /// Best-effort + non-fatal: never throws out of onCreate (claim stamping above
 /// must still succeed). Requires the SUPABASE_SERVICE_ROLE_KEY secret.
-async function grantSignupBonus(uid, isAnonymous) {
+async function grantFreeSignupLedger(uid) {
   try {
     const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
     if (!key) {
-      console.warn(`signup_bonus SKIPPED uid=${uid}: SUPABASE_SERVICE_ROLE_KEY unset`);
+      console.warn(`free_signup SKIPPED uid=${uid}: SUPABASE_SERVICE_ROLE_KEY unset`);
       return;
     }
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/claim_signup_bonus`, {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/credits_ledger`, {
       method: 'POST',
       headers: {
         apikey: key,
         Authorization: `Bearer ${key}`,
         'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
       },
-      body: JSON.stringify({ p_uid: uid, p_is_anonymous: isAnonymous }),
+      body: JSON.stringify({
+        firebase_uid: uid,
+        delta: 1,
+        reason: 'free_signup',
+        pack: 'free',
+        idempotency_key: `free_signup:${uid}`,
+      }),
     });
-    if (res.ok) {
-      console.log(`signup_bonus uid=${uid} anon=${isAnonymous}: ${await res.text()}`);
+    if (res.status === 201 || res.status === 204) {
+      console.log(`free_signup GRANTED uid=${uid}`);
+    } else if (res.status === 409) {
+      console.log(`free_signup ALREADY uid=${uid}`); // unique_violation = idempotent
     } else {
-      console.warn(`signup_bonus UNEXPECTED ${res.status} uid=${uid}: ${await res.text()}`);
+      console.warn(`free_signup UNEXPECTED ${res.status} uid=${uid}: ${await res.text()}`);
     }
   } catch (e) {
-    console.warn(`signup_bonus ERROR uid=${uid}: ${e.message}`);
+    console.warn(`free_signup ERROR uid=${uid}: ${e.message}`);
   }
 }
 
@@ -166,12 +170,9 @@ exports.stampAuthRoleOnCreate = functionsV1
   .onCreate(async (user) => {
     // 1) TPA role claim — required for RLS reads + spend_credit as `authenticated`.
     await getAuth().setCustomUserClaims(user.uid, { role: 'authenticated' });
-    // 2) Signup credit for EVERY provider (the bug fix: Google/Apple paths never
-    //    called grantFreeSignup, so new federated accounts got 0 credits).
-    //    ANONYMITY GATE: providerData is empty only for anonymous accounts. They
-    //    still get the +1; the DB refuses them a founders slot on this argument.
-    const isAnonymous = !user.providerData || user.providerData.length === 0;
-    await grantSignupBonus(user.uid, isAnonymous);
+    // 2) Free-signup credit for EVERY provider (the bug fix: Google/Apple paths
+    //    never called grantFreeSignup, so new federated accounts got 0 credits).
+    await grantFreeSignupLedger(user.uid);
   });
 
 // Lazy-resolve helpers so cold starts only init clients when actually used.
@@ -1268,6 +1269,11 @@ function boxToExtract(box, width, height) {
 
 /** Build a `listings` doc payload conforming to the live hardened schema. */
 function buildListingDoc(uid, f) {
+  // Prefer the full captured-photo gallery (all angles the user shot); fall
+  // back to the single server-cropped cover for legacy callers.
+  const photos = (Array.isArray(f.photos) && f.photos.length)
+    ? f.photos
+    : [f.photo_url];
   return {
     seller_id: uid,
     title: f.title,
@@ -1275,8 +1281,8 @@ function buildListingDoc(uid, f) {
     category: f.category || 'Other',
     condition: f.condition || 'Good',
     price: f.price,
-    photos: [f.photo_url],      // list — what the app feed reads
-    photo_url: f.photo_url,     // convenience mirror (Admin-written)
+    photos: photos,             // list — what the app feed reads (all photos)
+    photo_url: f.photo_url,     // cropped-cover mirror (Admin-written)
     qr_url: f.qr_url,
     status: 'active',           // lowercase — required by firestore.rules
     view_count: 0,
@@ -1286,7 +1292,7 @@ function buildListingDoc(uid, f) {
 
 // ---- FUNCTION 1: detectItemsFromPhoto ---------------------------------------
 
-const DETECT_PROMPT = `You are a marketplace listing assistant. Look at the image and identify each distinct sellable physical item.
+const DETECT_PROMPT = `You are a marketplace listing assistant. Look at the image and identify EVERY distinct sellable physical item you can see. Be thorough: a typical desk, shelf, or room photo contains several separate items — include smaller or partially-visible ones, and return a SEPARATE entry for each. Do NOT merge different items into one, and do NOT invent items that are not clearly visible.
 
 Return ONLY valid JSON (no markdown, no code fences, no commentary) in EXACTLY this shape:
 {
@@ -1308,6 +1314,43 @@ Rules:
 - box coordinates are integers normalized 0-1000 with origin at the TOP-LEFT (Gemini convention): ymin/xmin = top-left corner, ymax/xmax = bottom-right corner.
 - One entry per distinct item. If only one item, return one entry.
 - If you see no sellable item, return {"items": []}.`;
+
+/**
+ * Salvage every COMPLETE {...} item object from a truncated/malformed items
+ * JSON array (e.g. the model hit max_tokens mid-array). Walks brace depth,
+ * ignoring braces inside strings, and JSON.parses each closed object; a
+ * truncated final object is simply skipped. Returns [] if nothing usable.
+ */
+function salvageItems(text) {
+  const arrStart = text.indexOf('[', text.indexOf('"items"'));
+  if (arrStart < 0) return [];
+  const out = [];
+  let depth = 0;
+  let objStart = -1;
+  let inStr = false;
+  let esc = false;
+  for (let i = arrStart + 1; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') { if (depth === 0) objStart = i; depth++; }
+    else if (c === '}') {
+      depth--;
+      if (depth === 0 && objStart >= 0) {
+        try { out.push(JSON.parse(text.slice(objStart, i + 1))); } catch (_) { /* skip */ }
+        objStart = -1;
+      }
+    } else if (c === ']' && depth === 0) {
+      break;
+    }
+  }
+  return out;
+}
 
 exports.detectItemsFromPhoto = onCall(
   // GEMINI for detection + boxes; ANTHROPIC for the Stage-2 web_search SOLD-comps
@@ -1354,7 +1397,11 @@ exports.detectItemsFromPhoto = onCall(
           break;
         } catch (e) {
           lastErr = e;
-          const transient = /\b(50[0-9]|429)\b|unavailable|high demand|overload|quota|rate.?limit/i
+          // Only retry genuinely transient server errors (503/overload). A 429
+          // quota / prepay-depleted / rate-limit will NOT recover in a few
+          // seconds — retrying just burns ~15s and blows the client timeout, so
+          // fail fast straight to the Claude fallback instead.
+          const transient = /\b50[0-9]\b|unavailable|high demand|overload/i
               .test(String(e));
           if (!transient) throw e;
           console.warn(`Gemini transient error (attempt ${attempt + 1}/4), retrying`, String(e));
@@ -1369,8 +1416,30 @@ exports.detectItemsFromPhoto = onCall(
         .map((p) => p.text || '')
         .join('');
     } catch (e) {
-      console.error('Gemini generateContent failed', String(e));
-      return { items: [], storagePath, width, height, error: 'vision_failed' };
+      // Gemini unavailable (429 / quota / prepay-depleted / 503). FALL BACK to
+      // Claude vision so the user still gets a real ad instead of a blank one —
+      // same DETECT_PROMPT / JSON contract, so the parse + pricing below are
+      // unchanged. ANTHROPIC_API_KEY is already a secret on this function.
+      console.error('Gemini generateContent failed, falling back to Claude vision', String(e));
+      try {
+        const mt = /^image\/(jpe?g|png|gif|webp)$/i.test(contentType)
+          ? contentType.toLowerCase()
+          : 'image/jpeg';
+        raw = await claudeText({
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mt, data: buffer.toString('base64') } },
+            { type: 'text', text: DETECT_PROMPT },
+          ],
+          // 8192 (Claude max output): a 10-item response with per-item
+          // description + box is large; 2048 truncated it mid-array, which the
+          // JSON parser then dropped to ~1 garbage item at $0.
+          maxTokens: 8192,
+        });
+        console.log('Claude vision fallback OK');
+      } catch (e2) {
+        console.error('Claude vision fallback also failed', String(e2));
+        return { items: [], storagePath, width, height, error: 'vision_failed' };
+      }
     }
 
     // Strip code fences defensively, then parse.
@@ -1383,8 +1452,15 @@ exports.detectItemsFromPhoto = onCall(
     try {
       parsed = JSON.parse(cleaned);
     } catch (e) {
-      console.warn('JSON parse failed', cleaned.slice(0, 500));
-      return { items: [], storagePath, width, height, error: 'parse_failed' };
+      // Truncated/malformed JSON — salvage the complete items instead of
+      // dropping the whole scan to a single garbage $0 item.
+      const salvaged = salvageItems(cleaned);
+      if (salvaged.length === 0) {
+        console.warn('JSON parse failed, nothing salvageable', cleaned.slice(0, 500));
+        return { items: [], storagePath, width, height, error: 'parse_failed' };
+      }
+      console.log('JSON parse failed; salvaged items from truncated response', salvaged.length);
+      parsed = { items: salvaged };
     }
 
     const items = Array.isArray(parsed.items) ? parsed.items : [];
@@ -1427,6 +1503,7 @@ exports.detectItemsFromPhoto = onCall(
         suggested: price.suggested,
         reason: price.reason,
         comp_basis: price.comp_basis,
+        confidence: price.confidence,
       };
     }));
 
@@ -1444,16 +1521,65 @@ exports.detectItemsFromPhoto = onCall(
 
 // ---- FUNCTION 2: publishListingsFromDetection -------------------------------
 
+// Single-writer marketplace post used by publishListingsFromDetection. Non-fatal:
+// if the web POST fails we keep the Firestore mirror and return no url. The web
+// route authenticates via x-app-secret and writes Supabase with the service-role
+// key (server-side); status is 'active' once APP_POSTS_AUTOPUBLISH=true.
+async function postToMarketplace({ uid, title, description, price, category, condition, photos, locationCity, lat, lng, publishKey }) {
+  try {
+    const res = await fetch(WEB_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-app-secret': APP_LISTINGS_SECRET.value() },
+      body: JSON.stringify({ title, description, price, category, condition,
+        photos: photos || [], sellerId: uid, locationCity, lat, lng, source: 'app', publishKey }),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) { console.warn('postToMarketplace web error', res.status, json && json.error); return { id: '', url: '' }; }
+    return { id: json.id || '', url: json.url || '' }; // url = https://zazooomit.com/listing/<id>
+  } catch (e) { console.error('postToMarketplace fetch failed', String(e)); return { id: '', url: '' }; }
+}
+
 exports.publishListingsFromDetection = onCall(
-  { region: PHOTO_REGION, memory: '1GiB', timeoutSeconds: 300 },
+  { region: PHOTO_REGION, memory: '1GiB', timeoutSeconds: 300, secrets: [APP_LISTINGS_SECRET] },
   async (request) => {
     const uid = requireAuth(request);
     const data = request.data || {};
     const storagePath = sanitizeStoragePath(data.storagePath);
     const mode = data.mode === 'bundle' ? 'bundle' : 'separate';
-    const items = Array.isArray(data.items) ? data.items : [];
+    let items = Array.isArray(data.items) ? data.items : [];
+    // Per-publish-action idempotency key — appended with the item index (or
+    // '#bundle') so each row is unique within ONE publish, while a re-fired
+    // publish reproduces the SAME keys and the unique index dedupes them.
+    const publishKey = data.publishKey ? String(data.publishKey) : null;
+    // Full gallery of photos the client uploaded (all captured angles). Stored
+    // as the listing's `photos` array; falls back to the server-cropped cover
+    // when the client sends none (older app builds).
+    const clientPhotos = Array.isArray(data.photos)
+      ? data.photos.filter((u) => typeof u === 'string' && /^https?:\/\//.test(u))
+      : [];
     if (items.length === 0) {
-      throw new HttpsError('invalid-argument', 'items[] must be non-empty.');
+      // BUNDLE from the multi-item review clears detectedItems and drives the
+      // listing purely from bundleTitle/Price/Description — so an empty items[]
+      // is valid for bundle mode. The shipped client (call_publish_listings.dart)
+      // OMITS bundleTitle entirely whenever the draft title is empty (the common
+      // case: the bundle flow never populates listingDraftTitle, or the slow scan
+      // hadn't filled it in yet), while still relying on the server to synthesize
+      // the bundle. Hinging the fallback on bundleTitle being present therefore
+      // 400s ("Couldn't post") on the real path. Synthesize a single item from
+      // whatever bundle fields arrived, defaulting the title, so a bundle ALWAYS
+      // lists. Separate mode still requires real items.
+      if (mode === 'bundle') {
+        const bt = data.bundleTitle && String(data.bundleTitle).trim();
+        items = [{
+          title: bt || 'Bundle',
+          description: data.bundleDescription ? String(data.bundleDescription) : '',
+          category: '',
+          condition: '',
+          priceEstimate: data.bundlePrice != null ? safeNum(data.bundlePrice) : 0,
+        }];
+      } else {
+        throw new HttpsError('invalid-argument', 'items[] must be non-empty.');
+      }
     }
     console.log('publishListingsFromDetection', { uid, mode, count: items.length });
 
@@ -1474,7 +1600,9 @@ exports.publishListingsFromDetection = onCall(
       const sum = items.reduce((acc, it) => acc + safeNum(it.priceEstimate != null ? it.priceEstimate : it.price), 0);
 
       const title = (data.bundleTitle && String(data.bundleTitle).trim())
-        || `Bundle: ${items.length} items`;
+        || (items.length === 1
+              ? String(items[0].title || 'Bundle')
+              : `Bundle: ${items.length} items`);
       const description = (data.bundleDescription && String(data.bundleDescription).trim())
         || lines.join('\n');
       const price = data.bundlePrice != null ? safeNum(data.bundlePrice) : sum;
@@ -1482,8 +1610,23 @@ exports.publishListingsFromDetection = onCall(
       const photoBuf = await sharpLib()(buffer).jpeg({ quality: 85 }).toBuffer();
       const photo_url = await savePublic(
         bucket, `listings/${uid}/${listingId}/photo.jpg`, photoBuf, 'image/jpeg');
-      const qr_url = await savePublic(
-        bucket, `listings/${uid}/${listingId}/qr.png`, await qrBuffer(listingId), 'image/png');
+      // Bundle = one item photographed from several angles -> attach EVERY
+      // captured photo, not just the cropped cover.
+      const galleryPhotos = clientPhotos.length ? clientPhotos : [photo_url];
+
+      // SINGLE WRITER: marketplace row (active), QR from the live url.
+      const web = await postToMarketplace({
+        uid, title, description, price,
+        category: items[0] && items[0].category,
+        condition: items[0] && items[0].condition,
+        photos: galleryPhotos,
+        publishKey: publishKey ? `${publishKey}#bundle` : null,
+      });
+      const qr_url = web.url
+        ? await savePublic(
+            bucket, `listings/${uid}/${listingId}/qr.png`,
+            await qrBuffer(web.url), 'image/png')
+        : '';
 
       await ref.set(buildListingDoc(uid, {
         title,
@@ -1492,11 +1635,12 @@ exports.publishListingsFromDetection = onCall(
         condition: items[0] && items[0].condition,
         price,
         photo_url,
+        photos: galleryPhotos,
         qr_url,
       }));
 
-      console.log('bundle listing created', listingId);
-      return { mode, listings: [{ listingId, photo_url, qr_url }] };
+      console.log('bundle listing created', listingId, 'web', web.id || 'none', 'photos', galleryPhotos.length);
+      return { mode, listings: [{ listingId, photo_url, photos: galleryPhotos, qr_url, url: web.url || '' }] };
     }
 
     // ----- SEPARATE: one listing per item, cropped to its box -----
@@ -1520,21 +1664,44 @@ exports.publishListingsFromDetection = onCall(
 
       const photo_url = await savePublic(
         bucket, `listings/${uid}/${listingId}/photo.jpg`, photoBuf, 'image/jpeg');
-      const qr_url = await savePublic(
-        bucket, `listings/${uid}/${listingId}/qr.png`, await qrBuffer(listingId), 'image/png');
+
+      const title = it.title || it.label || `Item ${i + 1}`;
+      const description = it.description || '';
+      const category = it.category;
+      const condition = it.condition;
+      const price = safeNum(it.priceEstimate != null ? it.priceEstimate : it.price);
+
+      // Single detected item => all captured photos belong to it. Multi-item
+      // => keep the per-item cropped cover only (raw angles are ambiguous).
+      const galleryPhotos = (items.length === 1 && clientPhotos.length)
+        ? clientPhotos
+        : [photo_url];
+
+      // SINGLE WRITER: create the Supabase marketplace row (active via
+      // APP_POSTS_AUTOPUBLISH), then build the QR from its LIVE url so it never 404s.
+      const web = await postToMarketplace({
+        uid, title, description, price, category, condition, photos: galleryPhotos,
+        publishKey: publishKey ? `${publishKey}#${i}` : null,
+      });
+      const qr_url = web.url
+        ? await savePublic(
+            bucket, `listings/${uid}/${listingId}/qr.png`,
+            await qrBuffer(web.url), 'image/png')
+        : '';
 
       await ref.set(buildListingDoc(uid, {
-        title: it.title || it.label || `Item ${i + 1}`,
-        description: it.description || '',
-        category: it.category,
-        condition: it.condition,
-        price: safeNum(it.priceEstimate != null ? it.priceEstimate : it.price),
+        title,
+        description,
+        category,
+        condition,
+        price,
         photo_url,
+        photos: galleryPhotos,
         qr_url,
       }));
 
-      console.log('separate listing created', listingId, i);
-      results.push({ listingId, photo_url, qr_url });
+      console.log('separate listing created', listingId, 'web', web.id || 'none', 'photos', galleryPhotos.length);
+      results.push({ listingId, photo_url, photos: galleryPhotos, qr_url, url: web.url || '' });
     }
 
     return { mode, listings: results };
@@ -1867,6 +2034,7 @@ exports.postListing = onCall(
       lat: d.lat,
       lng: d.lng,
       source: 'app',
+      publishKey: d.publishKey || null,
     };
 
     let res;
