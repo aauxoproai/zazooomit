@@ -1525,13 +1525,23 @@ exports.detectItemsFromPhoto = onCall(
 // if the web POST fails we keep the Firestore mirror and return no url. The web
 // route authenticates via x-app-secret and writes Supabase with the service-role
 // key (server-side); status is 'active' once APP_POSTS_AUTOPUBLISH=true.
-async function postToMarketplace({ uid, title, description, price, category, condition, photos, locationCity, lat, lng, publishKey }) {
+async function postToMarketplace({ uid, title, description, price, category, condition, photos, locationCity, lat, lng, zip, publishKey }) {
   try {
     const res = await fetch(WEB_API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-app-secret': APP_LISTINGS_SECRET.value() },
+      // `zip` is the seller's postal code, forwarded verbatim. /api/listings
+      // treats a present zip as AUTHORITATIVE: it resolves lat, lng, currency
+      // (US -> USD, CA -> CAD) and the place string from it and ignores any
+      // client coordinates. Without one the route takes its fail-open legacy
+      // branch and the row lands with NULL lat/lng — invisible to every radius
+      // search, which is the defect this forwards to fix.
+      //
+      // BACKWARD-COMPATIBLE: undefined when the app sends none, and
+      // JSON.stringify drops undefined keys, so the body is byte-identical to
+      // today's for any caller that has no postal-code field yet.
       body: JSON.stringify({ title, description, price, category, condition,
-        photos: photos || [], sellerId: uid, locationCity, lat, lng, source: 'app', publishKey }),
+        photos: photos || [], sellerId: uid, locationCity, lat, lng, zip, source: 'app', publishKey }),
     });
     const json = await res.json().catch(() => ({}));
     if (!res.ok) { console.warn('postToMarketplace web error', res.status, json && json.error); return { id: '', url: '' }; }
@@ -1551,6 +1561,10 @@ exports.publishListingsFromDetection = onCall(
     // '#bundle') so each row is unique within ONE publish, while a re-fired
     // publish reproduces the SAME keys and the unique index dedupes them.
     const publishKey = data.publishKey ? String(data.publishKey) : null;
+    // Seller's postal code (US ZIP or CA postal), validated client-side before
+    // publish. Undefined for app builds that predate the field — the web route
+    // fails open on a missing zip, so those keep publishing exactly as before.
+    const zip = data.zip ? String(data.zip).trim().slice(0, 20) : undefined;
     // Full gallery of photos the client uploaded (all captured angles). Stored
     // as the listing's `photos` array; falls back to the server-cropped cover
     // when the client sends none (older app builds).
@@ -1620,6 +1634,7 @@ exports.publishListingsFromDetection = onCall(
         category: items[0] && items[0].category,
         condition: items[0] && items[0].condition,
         photos: galleryPhotos,
+        zip,
         publishKey: publishKey ? `${publishKey}#bundle` : null,
       });
       const qr_url = web.url
@@ -1681,6 +1696,7 @@ exports.publishListingsFromDetection = onCall(
       // APP_POSTS_AUTOPUBLISH), then build the QR from its LIVE url so it never 404s.
       const web = await postToMarketplace({
         uid, title, description, price, category, condition, photos: galleryPhotos,
+        zip,
         publishKey: publishKey ? `${publishKey}#${i}` : null,
       });
       const qr_url = web.url
