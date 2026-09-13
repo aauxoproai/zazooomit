@@ -115,64 +115,97 @@ setGlobalOptions({ region: 'us-central1', maxInstances: 10 });
 // Supabase project REST base (public URL — not a secret).
 const SUPABASE_URL = 'https://rilyitrvilprhtxlocgc.supabase.co';
 
-/// One-time free-signup credit, written SERVER-SIDE for EVERY new account
-/// regardless of provider (Google, email/password, Apple, anonymous). onCreate
-/// fires exactly once per account, so this is the provider-agnostic equivalent of
-/// the website's handle_new_user() trigger (which only fires for Supabase
-/// auth.users rows, never for Firebase/TPA app users).
+/// One-time signup credit, written SERVER-SIDE for EVERY new account regardless
+/// of provider (Google, email/password, Apple, anonymous). onCreate fires exactly
+/// once per account, so this is the provider-agnostic equivalent of the website's
+/// handle_new_user() trigger (which only fires for Supabase auth.users rows).
 ///
-/// Idempotent + replay-proof with the SAME guarantee as POST /api/credits/grant:
-/// idempotency_key = 'free_signup:<uid>' + the UNIQUE index credits_ledger_idem_uidx.
-/// A duplicate insert returns HTTP 409, which we treat as already-granted. So a
-/// uid can only ever receive this grant once — even though the app ALSO calls
-/// grantFreeSignup() on some paths (both collapse to one row via the same key).
+/// ⚠️ This used to INSERT into credits_ledger directly. It must not: a raw
+/// free_signup row made the uid look like a pre-existing account to
+/// claim_signup_bonus(), whose guard then returned 'existing' and made the
+/// Founders-1000 branch unreachable for every user (0 slots claimed, ever).
+/// The single grant point is now the DB function, which owns the +1-vs-top-up
+/// decision atomically. See sql/founders_1000.sql.
+///
+/// p_is_anonymous is passed so the DB can never award a founders slot from this
+/// path. Anonymous accounts keep the +1 (product decision) but must never consume
+/// a promo slot — a slot is claimed later, at the real signup/linking event, by
+/// /auth/session. providerData is empty for anonymous accounts.
+///
+/// RETRY: a transient 5xx (2026-09-13: PostgREST 504 Gateway Timeout) or a thrown
+/// fetch error is retried up to SIGNUP_BONUS_ATTEMPTS times with a 1s/2s backoff
+/// and a per-attempt abort timeout. Safe because claim_signup_bonus() is
+/// idempotent (ON CONFLICT on 'free_signup:<uid>') — a 504 whose insert actually
+/// committed just comes back as {"status":"already"} on the retry. 4xx is a
+/// request/config problem a retry cannot fix, so it logs UNEXPECTED and stops.
 ///
 /// Best-effort + non-fatal: never throws out of onCreate (claim stamping above
 /// must still succeed). Requires the SUPABASE_SERVICE_ROLE_KEY secret.
-async function grantFreeSignupLedger(uid) {
-  try {
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!key) {
-      console.warn(`free_signup SKIPPED uid=${uid}: SUPABASE_SERVICE_ROLE_KEY unset`);
-      return;
-    }
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/credits_ledger`, {
-      method: 'POST',
-      headers: {
-        apikey: key,
-        Authorization: `Bearer ${key}`,
-        'Content-Type': 'application/json',
-        Prefer: 'return=minimal',
-      },
-      body: JSON.stringify({
-        firebase_uid: uid,
-        delta: 1,
-        reason: 'free_signup',
-        pack: 'free',
-        idempotency_key: `free_signup:${uid}`,
-      }),
-    });
-    if (res.status === 201 || res.status === 204) {
-      console.log(`free_signup GRANTED uid=${uid}`);
-    } else if (res.status === 409) {
-      console.log(`free_signup ALREADY uid=${uid}`); // unique_violation = idempotent
-    } else {
-      console.warn(`free_signup UNEXPECTED ${res.status} uid=${uid}: ${await res.text()}`);
-    }
-  } catch (e) {
-    console.warn(`free_signup ERROR uid=${uid}: ${e.message}`);
+const SIGNUP_BONUS_ATTEMPTS = 3;
+const SIGNUP_BONUS_TIMEOUT_MS = 10000;
+
+async function grantSignupBonus(uid, isAnonymous) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) {
+    console.warn(`signup_bonus SKIPPED uid=${uid}: SUPABASE_SERVICE_ROLE_KEY unset`);
+    return;
   }
+
+  let lastError = 'unknown';
+  for (let attempt = 1; attempt <= SIGNUP_BONUS_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), SIGNUP_BONUS_TIMEOUT_MS);
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/claim_signup_bonus`, {
+        method: 'POST',
+        headers: {
+          apikey: key,
+          Authorization: `Bearer ${key}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ p_uid: uid, p_is_anonymous: isAnonymous }),
+        signal: controller.signal,
+      });
+      const body = await res.text();
+      if (res.ok) {
+        console.log(`signup_bonus uid=${uid} anon=${isAnonymous}: ${body}`);
+        return;
+      }
+      if (res.status < 500) {
+        console.warn(`signup_bonus UNEXPECTED ${res.status} uid=${uid}: ${body}`);
+        return;
+      }
+      lastError = `${res.status} ${body}`;
+    } catch (e) {
+      lastError = e.name === 'AbortError'
+        ? `timeout after ${SIGNUP_BONUS_TIMEOUT_MS}ms`
+        : e.message;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (attempt < SIGNUP_BONUS_ATTEMPTS) {
+      console.warn(`signup_bonus RETRY uid=${uid} attempt=${attempt}: ${lastError}`);
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
+  }
+  console.warn(`signup_bonus FAILED uid=${uid} after ${SIGNUP_BONUS_ATTEMPTS} attempts: ${lastError}`);
 }
 
 exports.stampAuthRoleOnCreate = functionsV1
+  // Pinned: the live function is us-east1. v1 ignores setGlobalOptions, so
+  // without this a deploy would create a SECOND copy in us-central1.
+  .region('us-east1')
   .runWith({ secrets: ['SUPABASE_SERVICE_ROLE_KEY'] })
   .auth.user()
   .onCreate(async (user) => {
     // 1) TPA role claim — required for RLS reads + spend_credit as `authenticated`.
     await getAuth().setCustomUserClaims(user.uid, { role: 'authenticated' });
-    // 2) Free-signup credit for EVERY provider (the bug fix: Google/Apple paths
-    //    never called grantFreeSignup, so new federated accounts got 0 credits).
-    await grantFreeSignupLedger(user.uid);
+    // 2) Signup credit for EVERY provider (the bug fix: Google/Apple paths never
+    //    called grantFreeSignup, so new federated accounts got 0 credits).
+    //    ANONYMITY GATE: providerData is empty only for anonymous accounts. They
+    //    still get the +1; the DB refuses them a founders slot on this argument.
+    const isAnonymous = !user.providerData || user.providerData.length === 0;
+    await grantSignupBonus(user.uid, isAnonymous);
   });
 
 // Lazy-resolve helpers so cold starts only init clients when actually used.
