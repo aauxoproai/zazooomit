@@ -114,6 +114,7 @@ setGlobalOptions({ region: 'us-central1', maxInstances: 10 });
 
 // Supabase project REST base (public URL — not a secret).
 const SUPABASE_URL = 'https://jjghqjlgzpqguhwfplnz.supabase.co';
+const creditGate = require('./credit_gate');
 
 /// One-time signup credit, written SERVER-SIDE for EVERY new account regardless
 /// of provider (Google, email/password, Apple, anonymous). onCreate fires exactly
@@ -1630,6 +1631,15 @@ exports.publishListingsFromDetection = onCall(
     }
     console.log('publishListingsFromDetection', { uid, mode, count: items.length });
 
+    // CREDIT GATE (server-side, before anything is created). See credit_gate.js.
+    const gateCtx = {
+      supabaseUrl: SUPABASE_URL,
+      serviceKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+      authorization: request.rawRequest && request.rawRequest.headers && request.rawRequest.headers.authorization,
+      makeError: (code, msg) => new HttpsError(code, msg),
+    };
+    await creditGate.requireCredits({ ...gateCtx, uid, count: mode === 'bundle' ? 1 : items.length });
+
     const { buffer, bucket } = await downloadImage(storagePath);
     const meta = await sharpLib()(buffer).metadata();
     const width = meta.width || 0;
@@ -1639,6 +1649,7 @@ exports.publishListingsFromDetection = onCall(
     if (mode === 'bundle') {
       const ref = db.collection('listings').doc();
       const listingId = ref.id;
+      await creditGate.chargeListing({ ...gateCtx, listingId });
 
       const lines = items.map((it, i) => {
         const t = it.title || it.label || `Item ${i + 1}`;
@@ -1697,6 +1708,7 @@ exports.publishListingsFromDetection = onCall(
       const it = items[i];
       const ref = db.collection('listings').doc();
       const listingId = ref.id;
+      await creditGate.chargeListing({ ...gateCtx, listingId });
 
       const extract = boxToExtract(it.box, width, height);
       let photoBuf;
