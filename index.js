@@ -113,7 +113,7 @@ setGlobalOptions({ region: 'us-central1', maxInstances: 10 });
 // -----------------------------------------------------------------------------
 
 // Supabase project REST base (public URL — not a secret).
-const SUPABASE_URL = 'https://rilyitrvilprhtxlocgc.supabase.co';
+const SUPABASE_URL = 'https://jjghqjlgzpqguhwfplnz.supabase.co';
 
 /// One-time signup credit, written SERVER-SIDE for EVERY new account regardless
 /// of provider (Google, email/password, Apple, anonymous). onCreate fires exactly
